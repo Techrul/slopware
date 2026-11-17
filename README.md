@@ -1,2 +1,10 @@
 # slopware
 I vibe-code a bunch of bs cause I want to and you can't stop me
+# Why?
+Basically I kind of want to see if an incompetent coder like me can vibe-code something decent and how it stacks up to mature stuff.
+# Should I use any of these?
+No lol, I'll try and link good alternatives for each thing, they should be much more stable, have more features, more community, etc.
+# How much is AI doing?
+Like everything, all I do is prompting and writing the README unless I get particularly lazy.
+# Which AI are you using?
+Claude :)
