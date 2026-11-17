@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -1884,33 +1884,120 @@ class Editor(QPlainTextEdit):
 # Tabs
 # --------------------------------------------------------------------------
 
-class TabCloseButton(QToolButton):
-    def __init__(self, tab):
+class IconButton(QAbstractButton):
+    """Small button whose icon is drawn with lines, so it looks identical on every OS and font."""
+
+    def __init__(self, app, kind, slot=None, tip=None, width=46, height=None):
         super().__init__()
-        self.tab = tab
-        self.setObjectName("tabclose")
+        self.app, self.kind, self.hover = app, kind, False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAutoRaise(True)
-        self.hover = False
-        self.clicked.connect(lambda *_: tab.app.close_tab(tab))
-        self.refresh()
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        if width:
+            self.setFixedWidth(width)
+        if height:
+            self.setFixedHeight(height)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding if not height
+                           else QSizePolicy.Policy.Fixed)
+        if tip:
+            self.setToolTip(tip)
+        if slot:
+            self.clicked.connect(lambda *_: slot())
+
+    def sizeHint(self):
+        return QSize(self.width() or 46, 32)
+
+    def set_kind(self, kind, tip=None):
+        self.kind = kind
+        if tip:
+            self.setToolTip(tip)
+        self.update()
 
     def enterEvent(self, e):
         self.hover = True
-        self.refresh()
+        self.update()
         super().enterEvent(e)
 
     def leaveEvent(self, e):
         self.hover = False
-        self.refresh()
+        self.update()
         super().leaveEvent(e)
 
+    def icon_color(self):
+        return QColor(self.app.theme["ui_fg"])
+
+    def paint_background(self, p):
+        if self.hover or self.isDown():
+            danger = self.kind == "close"
+            p.fillRect(self.rect(), QColor("#e81123" if danger else self.app.theme["ui_hover"]))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        self.paint_background(p)
+        color = self.icon_color()
+        if self.kind == "close" and (self.hover or self.isDown()):
+            color = QColor("#ffffff")
+        cx = int(self.width() / 2)
+        cy = int(self.height() / 2)
+        s = 5
+        pen = QPen(color, 1)
+        pen.setCapStyle(Qt.PenCapStyle.SquareCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        k = self.kind
+        if k == "min":
+            p.drawLine(cx - s, cy, cx + s, cy)
+        elif k == "max":
+            p.drawRect(cx - s, cy - s, 2 * s, 2 * s)
+        elif k == "restore":
+            p.drawRect(cx - s, cy - s + 2, 2 * s - 2, 2 * s - 2)
+            p.drawLine(cx - s + 2, cy - s, cx + s, cy - s)
+            p.drawLine(cx + s, cy - s, cx + s, cy + s - 2)
+        elif k == "plus":
+            p.drawLine(cx - s, cy, cx + s, cy)
+            p.drawLine(cx, cy - s, cx, cy + s)
+        else:  # close / x
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(QPen(color, 1.15))
+            s2 = 4.0 if k == "x" else 5.0
+            p.drawLine(QPointF(cx - s2, cy - s2), QPointF(cx + s2 + 0.5, cy + s2 + 0.5))
+            p.drawLine(QPointF(cx - s2, cy + s2 + 0.5), QPointF(cx + s2 + 0.5, cy - s2))
+        p.end()
+
+
+class TabCloseButton(IconButton):
+    """The x on each tab. Shows a dot instead when the file has unsaved changes."""
+
+    def __init__(self, tab):
+        super().__init__(tab.app, "x", lambda: tab.app.close_tab(tab), width=20, height=20)
+        self.tab = tab
+
+    def show_dot(self):
+        return self.tab.is_modified() and not self.hover
+
     def refresh(self):
-        mod = self.tab.is_modified()
-        self.setText("×" if (self.hover or not mod) else "●")
-        self.setProperty("modified", "true" if (mod and not self.hover) else "false")
-        self.style().unpolish(self)
-        self.style().polish(self)
+        self.update()
+
+    def paint_background(self, p):
+        if self.hover or self.isDown():
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self.app.theme["ui_hover"]))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 4, 4)
+
+    def icon_color(self):
+        t = self.app.theme
+        return QColor(t["accent"] if self.hover else t["ui_dim"])
+
+    def paintEvent(self, e):
+        if self.show_dot():
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self.app.theme["accent"]))
+            p.drawEllipse(QPointF(self.width() / 2, self.height() / 2), 3.5, 3.5)
+            p.end()
+            return
+        super().paintEvent(e)
 
 
 class Tab:
@@ -1936,7 +2023,7 @@ class Tab:
     def title(self):
         if self.path:
             return os.path.basename(self.path)
-        return self.suggested_name or "Untitled-%d" % self.untitled_no
+        return self.suggested_name or "Untitled-%d.txt" % self.untitled_no
 
     def is_modified(self):
         try:
@@ -2278,19 +2365,46 @@ class TitleBar(QWidget):
         self.menubar.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         lay.addWidget(self.menubar)
         lay.addStretch(1)
+        # The title floats on top, centred on the whole window (not just the gap between menus and buttons)
         self.title = label("", "title")
-        lay.addWidget(self.title)
-        lay.addStretch(1)
-        self.btn_min = tool("–", lambda: app.win.showMinimized(), name="winbtn", tip="Minimize")
-        self.btn_max = tool("□", app.toggle_maximize, name="winbtn", tip="Maximize")
-        self.btn_close = tool("✕", app.win.close, name="closebtn", tip="Close")
+        self.title.setParent(self)
+        self.title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title_text = ""
+        self.btn_min = IconButton(app, "min", lambda: app.win.showMinimized(), "Minimize")
+        self.btn_max = IconButton(app, "max", app.toggle_maximize, "Maximize")
+        self.btn_close = IconButton(app, "close", app.win.close, "Close")
         for b in (self.btn_min, self.btn_max, self.btn_close):
-            b.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
             lay.addWidget(b)
+
+    def set_title(self, text):
+        self._title_text = text
+        self.place_title()
+
+    def place_title(self):
+        fm = self.title.fontMetrics()
+        left = self.menubar.geometry().right() + 16
+        right = (self.btn_min.geometry().left() if self.btn_min.isVisible() else self.width()) - 16
+        avail = max(0, right - left)
+        text = fm.elidedText(self._title_text, Qt.TextElideMode.ElideMiddle, avail)
+        w = min(avail, fm.horizontalAdvance(text) + 6)
+        x = (self.width() - w) // 2
+        x = max(left, min(x, right - w))
+        self.title.setText(text)
+        self.title.setGeometry(x, 0, w, self.height())
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.place_title()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self.place_title)
 
     def set_frameless(self, frameless):
         for w in (self.btn_min, self.btn_max, self.btn_close, self.title):
             w.setVisible(frameless)
+        QTimer.singleShot(0, self.place_title)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self.app.frameless:
@@ -2849,7 +2963,10 @@ class App:
             return
         edge = 1 if (self.frameless and not self.win.isMaximized() and not self.win.isFullScreen()) else 0
         self.shell.lay.setContentsMargins(edge, edge, edge, edge)
-        self.titlebar.btn_max.setText("❐" if self.win.isMaximized() else "□")
+        if self.win.isMaximized():
+            self.titlebar.btn_max.set_kind("restore", "Restore")
+        else:
+            self.titlebar.btn_max.set_kind("max", "Maximize")
         self.shell.update()
 
     def _filter_obj(self):
@@ -2967,6 +3084,8 @@ class App:
         self.qapp.setFont(f)
         for t in self.tabs:
             t.editor.setFont(self.editor_font)
+        if hasattr(self, "titlebar"):
+            QTimer.singleShot(0, self.titlebar.place_title)
 
     # ---- UI
     def build_ui(self):
@@ -3004,7 +3123,7 @@ class App:
         self.tabbar.customContextMenuRequested.connect(self._tab_menu)
         th.addWidget(self.tabbar)
         th.addStretch(1)
-        th.addWidget(tool("+", self.new_tab, tip="New tab (Ctrl+N)"))
+        th.addWidget(IconButton(self, "plus", self.new_tab, "New tab (Ctrl+N)", width=38))
         lay.addWidget(tabrow)
         lay.addWidget(sep())
 
@@ -3809,7 +3928,7 @@ class App:
             where = "  (%s)" % os.path.dirname(tab.path) if tab.path else ""
             text = "%s%s%s - %s" % (mark, tab.title(), where, APP_NAME)
         self.win.setWindowTitle(text)
-        self.titlebar.title.setText(text)
+        self.titlebar.set_title(text)
 
     # ---- editor events
     def on_text_change(self, tab):
@@ -3963,7 +4082,7 @@ class App:
             return False
         path = tab.path
         if save_as or not path:
-            start = path or os.path.join(self._last_dir(), tab.suggested_name or "untitled.txt")
+            start = path or os.path.join(self._last_dir(), tab.title())
             path, _ = QFileDialog.getSaveFileName(self.win, "Save as", start)
             if not path:
                 return False
