@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.3.5"
+VERSION = "0.4.0"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -104,6 +104,13 @@ THEME_KEYS = [
     ("tab_active_fg", "Active tab text"),
     ("scrollbar", "Scrollbar"),
     ("scrollbar_hover", "Scrollbar (hover)"),
+    ("syn_keyword", "Code: keywords"),
+    ("syn_string", "Code: strings"),
+    ("syn_comment", "Code: comments"),
+    ("syn_number", "Code: numbers"),
+    ("syn_function", "Code: functions / keys"),
+    ("syn_type", "Code: types / variables"),
+    ("syn_constant", "Code: constants"),
 ]
 
 OLED_BASE = {
@@ -117,6 +124,8 @@ OLED_BASE = {
     "accent": "#8b6cff", "border": "#1f1f1f",
     "tab_active_bg": "#0e0e0e", "tab_active_fg": "#ffffff",
     "scrollbar": "#262626", "scrollbar_hover": "#4a4a4a",
+    "syn_keyword": "#b39dff", "syn_string": "#9ece6a", "syn_comment": "#5f6670", "syn_number": "#ff9e64",
+    "syn_function": "#7aa2f7", "syn_type": "#2ac3de", "syn_constant": "#ff757f",
 }
 
 
@@ -131,25 +140,35 @@ BUILTIN_THEMES = {
     "OLED Sea Breeze": _variant(
         fg="#dcf5f2", cursor="#5ff5e8", selection_bg="#0b3d3a",
         gutter_active="#5ff5e8", accent="#2ee6d6", ui_fg="#c9ecea",
-        ui_dim="#5c8c88", current_match_bg="#0f8a80", match_bg="#08302d"),
+        ui_dim="#5c8c88", current_match_bg="#0f8a80", match_bg="#08302d",
+        syn_keyword="#4fd6e8", syn_string="#9ff0c4", syn_comment="#3f6b68", syn_number="#ffb86c",
+        syn_function="#7fdbff", syn_type="#a5f3e8", syn_constant="#ff8fa3"),
     "OLED Mocha": _variant(
         fg="#cdd6f4", cursor="#f5e0dc", selection_bg="#313244",
         selection_fg="#cdd6f4", gutter_fg="#45475a", gutter_active="#b4befe",
         accent="#cba6f7", ui_fg="#bac2de", ui_dim="#6c7086",
-        match_bg="#3b2f3f", current_match_bg="#f9e2af", tab_active_fg="#cdd6f4"),
+        match_bg="#3b2f3f", current_match_bg="#f9e2af", tab_active_fg="#cdd6f4",
+        syn_keyword="#cba6f7", syn_string="#a6e3a1", syn_comment="#6c7086", syn_number="#fab387",
+        syn_function="#89b4fa", syn_type="#f9e2af", syn_constant="#f38ba8"),
     "OLED Matrix": _variant(
         fg="#33ff66", cursor="#00ff41", selection_bg="#003b12",
         selection_fg="#b6ffc8", gutter_fg="#0f4d1f", gutter_active="#33ff66",
         accent="#00ff41", ui_fg="#7dff9b", ui_dim="#2f7a44",
-        match_bg="#0d3a00", current_match_bg="#2a8a00", tab_active_fg="#00ff41"),
+        match_bg="#0d3a00", current_match_bg="#2a8a00", tab_active_fg="#00ff41",
+        syn_keyword="#b6ff3d", syn_string="#9effc1", syn_comment="#1f6b35", syn_number="#e6ff6b",
+        syn_function="#00ffaa", syn_type="#5dfc8d", syn_constant="#ffffff"),
     "OLED Crimson": _variant(
         cursor="#ff5470", selection_bg="#4a0b16", gutter_active="#ff8095",
-        accent="#ff3355", current_match_bg="#a3122b", match_bg="#33060e"),
+        accent="#ff3355", current_match_bg="#a3122b", match_bg="#33060e",
+        syn_keyword="#ff5470", syn_string="#ffb3c1", syn_comment="#5f5f5f", syn_number="#ff9e64",
+        syn_function="#ff8fab", syn_type="#e6a8ff", syn_constant="#ffd166"),
     "OLED Amber": _variant(
         fg="#ffb000", cursor="#ffcc33", selection_bg="#4d3500",
         selection_fg="#ffe08a", gutter_fg="#5c4000", gutter_active="#ffb000",
         accent="#ffb000", ui_fg="#ffc23d", ui_dim="#8a6000",
-        match_bg="#3d2c00", current_match_bg="#7a5500", tab_active_fg="#ffcc33"),
+        match_bg="#3d2c00", current_match_bg="#7a5500", tab_active_fg="#ffcc33",
+        syn_keyword="#ffd966", syn_string="#ffe9a8", syn_comment="#6b4c00", syn_number="#ff8c00",
+        syn_function="#ffc94d", syn_type="#ffcf7a", syn_constant="#ff6a00"),
     "Paper (light)": {
         "bg": "#fbfbf8", "fg": "#1f1f1f", "cursor": "#000000",
         "selection_bg": "#cfe0ff", "selection_fg": "#000000",
@@ -161,6 +180,8 @@ BUILTIN_THEMES = {
         "accent": "#5b5bd6", "border": "#d8d8d0",
         "tab_active_bg": "#fbfbf8", "tab_active_fg": "#000000",
         "scrollbar": "#cfcfc8", "scrollbar_hover": "#a6a69e",
+        "syn_keyword": "#7c3aed", "syn_string": "#15803d", "syn_comment": "#9a9a90", "syn_number": "#c2410c",
+        "syn_function": "#1d4ed8", "syn_type": "#0e7490", "syn_constant": "#b91c1c",
     },
 }
 DEFAULT_THEME = "OLED Black"
@@ -244,6 +265,7 @@ DEFAULT_SETTINGS = {
     "window_state": "",
     "monospace_only": True,
     "check_updates": False,
+    "syntax_highlighting": True,
     "last_update_check": 0.0,
 }
 
@@ -1047,10 +1069,10 @@ if __name__ == "__main__":
         sys.exit(_code)
 
 try:
-    from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
+    from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QRegularExpression, QSize, Qt, QTimer
     from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QFontMetricsF,
                                QIcon, QIntValidator, QKeySequence, QPainter, QPen, QPixmap,
-                               QTextCursor, QTextFormat)
+                               QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextFormat)
     from PySide6.QtWidgets import (QAbstractButton, QApplication, QColorDialog, QDialog,
                                    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                    QListWidget, QMenu, QMenuBar, QPlainTextEdit, QPushButton, QSizePolicy,
@@ -1357,6 +1379,358 @@ class DropButton(QPushButton):
 
 
 # --------------------------------------------------------------------------
+# Syntax highlighting
+# --------------------------------------------------------------------------
+
+SYN_KEYS = ("keyword", "string", "comment", "number", "function", "type", "constant")
+
+
+def _words(*groups):
+    words = sorted({w for g in groups for w in g.split()}, key=len, reverse=True)
+    return r"\b(?:%s)\b" % "|".join(re.escape(w) for w in words)
+
+
+_NUM = r"\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)[jJlLfFuU]*\b"
+_DQ = r'"(?:[^"\\]|\\.)*"?'
+_SQ = r"'(?:[^'\\]|\\.)*'?"
+_CALL = (r"\b([A-Za-z_]\w*)(?=\s*\()", "function", 1)
+
+
+def _clike(keywords, types="", constants="true false null", preprocessor=False, extra_tokens=()):
+    tokens = [(_NUM, "number", 0), _CALL, (_words(types), "type", 0) if types.strip() else None,
+              (_words(keywords), "keyword", 0), (_words(constants), "constant", 0),
+              (r"\b(?:class|struct|enum|interface|trait|impl|type)\s+([A-Za-z_]\w*)", "type", 1)]
+    if preprocessor:
+        tokens.append((r"^\s*#\s*\w+", "keyword", 0))
+    tokens.extend(extra_tokens)
+    regions = [("block", r"/\*", r"\*/", "comment"), ("line", r"//.*", "comment"),
+               ("line", _DQ, "string"), ("line", _SQ, "string")]
+    return {"tokens": [t for t in tokens if t], "regions": regions}
+
+
+LANGUAGES = {
+    "Python": {
+        "exts": (".py", ".pyw", ".pyi"), "shebang": ("python",),
+        "tokens": [
+            (_NUM, "number", 0), _CALL,
+            (_words("int float str bool list dict set tuple bytes bytearray object type len range print open "
+                    "isinstance issubclass enumerate zip map filter sorted reversed min max sum abs any all "
+                    "super property staticmethod classmethod iter next repr hash id input format round "
+                    "getattr setattr hasattr callable Exception ValueError TypeError KeyError IndexError "
+                    "RuntimeError OSError AttributeError ImportError StopIteration self cls"), "type", 0),
+            (_words("and as assert async await break class continue def del elif else except finally for "
+                    "from global if import in is lambda nonlocal not or pass raise return try while with "
+                    "yield match case"), "keyword", 0),
+            (_words("True False None"), "constant", 0),
+            (r"\bdef\s+([A-Za-z_]\w*)", "function", 1),
+            (r"\bclass\s+([A-Za-z_]\w*)", "type", 1),
+            (r"^\s*@[\w.]+", "type", 0),
+        ],
+        "regions": [("block", r'[rRbBuUfF]{0,2}"""', r'"""', "string"),
+                    ("block", r"[rRbBuUfF]{0,2}'''", r"'''", "string"),
+                    ("line", r"[rRbBuUfF]{0,2}" + _DQ, "string"), ("line", r"[rRbBuUfF]{0,2}" + _SQ, "string"),
+                    ("line", r"#.*", "comment")],
+    },
+    "JavaScript / TypeScript": dict(_clike(
+        "break case catch class const continue debugger default delete do else export extends finally for "
+        "function if import in instanceof let new return super switch this throw try typeof var void while "
+        "with yield async await of static get set from as type interface enum implements private public "
+        "protected readonly declare namespace abstract",
+        "Array Object String Number Boolean Promise Map Set Date Math JSON console window document RegExp "
+        "Error Symbol BigInt any unknown never string number boolean",
+        "true false null undefined NaN Infinity"),
+        exts=(".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts"), shebang=("node", "deno", "bun")),
+    "JSON": {
+        "exts": (".json", ".jsonc", ".mcmeta", ".geojson", ".webmanifest"),
+        "tokens": [(r"-?" + _NUM, "number", 0), (_words("true false null"), "constant", 0)],
+        "regions": [("line", r'"(?:[^"\\]|\\.)*"(?=\s*:)', "function"), ("line", _DQ, "string"),
+                    ("line", r"//.*", "comment"), ("block", r"/\*", r"\*/", "comment")],
+    },
+    "C / C++": dict(_clike(
+        "auto break case const continue default do else enum extern for goto if inline register restrict "
+        "return signed sizeof static struct switch typedef union unsigned volatile while class namespace "
+        "template typename public private protected virtual override final new delete this throw try catch "
+        "using constexpr noexcept operator friend explicit mutable static_cast dynamic_cast reinterpret_cast",
+        "void char short int long float double bool size_t int8_t int16_t int32_t int64_t uint8_t uint16_t "
+        "uint32_t uint64_t std string vector map unique_ptr shared_ptr",
+        "true false NULL nullptr", preprocessor=True),
+        exts=(".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hh", ".ino")),
+    "Java / Kotlin": dict(_clike(
+        "abstract assert break case catch class continue default do else enum extends final finally for if "
+        "implements import instanceof interface native new package private protected public return static "
+        "super switch synchronized this throw throws transient try volatile while var val fun object when "
+        "is in out data sealed override open companion lateinit record yield",
+        "void boolean byte char short int long float double String Object Integer List Map Set ArrayList "
+        "HashMap Unit Any",
+        "true false null", extra_tokens=[(r"@\w+", "type", 0)]),
+        exts=(".java", ".kt", ".kts", ".gradle")),
+    "C#": dict(_clike(
+        "abstract as base break case catch checked class const continue default delegate do else enum event "
+        "explicit extern finally fixed for foreach goto if implicit in interface internal is lock namespace "
+        "new operator out override params private protected public readonly ref return sealed sizeof static "
+        "struct switch this throw try typeof unchecked unsafe using virtual volatile while var async await "
+        "get set init record yield",
+        "void bool byte char decimal double float int long object sbyte short string uint ulong ushort "
+        "List Dictionary Task", "true false null"),
+        exts=(".cs",)),
+    "Rust": dict(_clike(
+        "as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod "
+        "move mut pub ref return self Self static struct super trait type unsafe use where while",
+        "i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64 bool char str String Vec Option Result "
+        "Box Rc Arc HashMap", "true false None Some Ok Err",
+        extra_tokens=[(r"\b\w+!", "function", 0), (r"#!?\[[^\]]*\]", "type", 0)]),
+        exts=(".rs",)),
+    "Go": dict(_clike(
+        "break case chan const continue default defer else fallthrough for func go goto if import interface "
+        "map package range return select struct switch type var",
+        "bool byte complex64 complex128 error float32 float64 int int8 int16 int32 int64 rune string uint "
+        "uint8 uint16 uint32 uint64 uintptr any", "true false nil iota"),
+        exts=(".go",)),
+    "HTML / XML": {
+        "exts": (".html", ".htm", ".xhtml", ".xml", ".svg", ".xaml", ".vue", ".plist"),
+        "tokens": [(r"</?[\w:.-]+|/?>|<\?\w*|\?>", "keyword", 0), (r"\s([\w:.@-]+)(?=\s*=)", "function", 1),
+                   (r"&#?\w+;", "constant", 0), (r"<!DOCTYPE[^>]*>", "type", 0)],
+        "regions": [("block", r"<!--", r"-->", "comment"), ("line", r'=\s*"[^"]*"?', "string"),
+                    ("line", r"=\s*'[^']*'?", "string")],
+    },
+    "CSS": {
+        "exts": (".css", ".scss", ".sass", ".less"),
+        "tokens": [(r"[.#][\w-]+", "type", 0), (r"-?\d*\.?\d+(?:px|em|rem|%|vh|vw|vmin|vmax|s|ms|deg|fr|pt)?\b",
+                                                "number", 0),
+                   (r"(?<![\w-])([\w-]+)\s*(?=:(?!:)[^{]*(?:;|$))", "function", 1),
+                   (r"#[0-9a-fA-F]{3,8}\b", "constant", 0), (r"@[\w-]+|!important", "keyword", 0),
+                   (r"\$[\w-]+|--[\w-]+", "constant", 0)],
+        "regions": [("block", r"/\*", r"\*/", "comment"), ("line", _DQ, "string"), ("line", _SQ, "string")],
+    },
+    "Markdown": {
+        "exts": (".md", ".markdown", ".mdx"),
+        "tokens": [(r"^\s*(?:[-*+]|\d+[.)])\s", "number", 0), (r"\[[^\]]*\]\([^)]*\)", "function", 0),
+                   (r"(?<![*\w])\*[^*\s][^*]*\*(?!\*)|(?<![_\w])_[^_\s][^_]*_(?!_)", "constant", 0),
+                   (r"\*\*[^*]+\*\*|__[^_]+__", "type", 0), (r"^\s*>.*", "comment", 0),
+                   (r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", "comment", 0), (r"^#{1,6}\s.*", "keyword", 0)],
+        "regions": [("block", r"^\s*(?:```|~~~)", r"^\s*(?:```|~~~)\s*$", "string"),
+                    ("line", r"`[^`]+`", "string")],
+    },
+    "Shell": {
+        "exts": (".sh", ".bash", ".zsh", ".fish", ".ksh"),
+        "names": (".bashrc", ".zshrc", ".profile", ".bash_profile", "pkgbuild", ".xprofile", ".xinitrc"),
+        "shebang": ("sh", "bash", "zsh", "fish", "ksh", "dash"),
+        "tokens": [(_NUM, "number", 0),
+                   (_words("echo cd ls cat grep sed awk printf read test sudo cp mv rm mkdir chmod chown find "
+                           "xargs curl wget git python python3 pacman yay paru apt dnf systemctl makepkg "
+                           "install tar ln touch sort head tail tee kill"), "function", 0),
+                   (r"^\s*([A-Za-z_]\w*)\s*\(\)", "function", 1),
+                   (_words("if then else elif fi for while until do done case esac in function return "
+                           "export local readonly declare unset shift source exit break continue select time"),
+                    "keyword", 0),
+                   (r"\$(?:\{[^}]*\}|\w+|[@*#?$!0-9-])", "type", 0), (_words("true false"), "constant", 0)],
+        "regions": [("line", _DQ, "string"), ("line", r"'[^']*'?", "string"),
+                    ("line", r"(?:^|(?<=\s))#.*", "comment")],
+    },
+    "Batch": {
+        "exts": (".bat", ".cmd"), "nocase": True,
+        "tokens": [(_NUM, "number", 0),
+                   (_words("echo off on set if else for in do goto call exit not exist defined errorlevel "
+                           "setlocal endlocal enabledelayedexpansion pause cls shift start title cd pushd "
+                           "popd equ neq lss leq gtr geq"), "keyword", 0),
+                   (r"^\s*:\w+", "function", 0), (r"%[\w~:]+%|%%?~?\w|![\w]+!", "type", 0)],
+        "regions": [("line", r"^\s*(?:@?rem\b|::).*", "comment"), ("line", r'"[^"]*"?', "string")],
+    },
+    "PowerShell": {
+        "exts": (".ps1", ".psm1", ".psd1"), "nocase": True, "shebang": ("pwsh", "powershell"),
+        "tokens": [(_NUM, "number", 0), (r"\b[A-Za-z]+-[A-Za-z]\w*\b", "function", 0),
+                   (_words("if else elseif foreach for while do until switch function param return try catch "
+                           "finally throw break continue in begin process end filter class enum using"),
+                    "keyword", 0),
+                   (r"-(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|and|or|not|contains|in|is)\b",
+                    "keyword", 0),
+                   (r"\$[\w:]+", "type", 0), (r"\$(?:true|false|null)\b", "constant", 0)],
+        "regions": [("block", r"<#", r"#>", "comment"), ("block", r'@"', r'^"@', "string"),
+                    ("line", r"#.*", "comment"), ("line", _DQ, "string"), ("line", r"'[^']*'?", "string")],
+    },
+    "Config (INI / TOML)": {
+        "exts": (".ini", ".toml", ".cfg", ".conf", ".properties", ".env", ".desktop", ".editorconfig",
+                 ".gitconfig", ".service"),
+        "tokens": [(r"-?" + _NUM, "number", 0),
+                   (_words("true false yes no on off True False"), "constant", 0),
+                   (r"^\s*([\w.\-\"' ]+?)\s*(?=[=:])", "function", 1), (r"^\s*\[\[?[^\]]*\]\]?", "keyword", 0)],
+        "regions": [("line", r"^\s*[;#].*", "comment"), ("block", r'"""', r'"""', "string"),
+                    ("line", _DQ, "string"), ("line", r"'[^']*'?", "string")],
+    },
+    "YAML": {
+        "exts": (".yml", ".yaml"),
+        "tokens": [(r"-?" + _NUM, "number", 0),
+                   (_words("true false null yes no on off True False Null"), "constant", 0),
+                   (r"^\s*(?:-\s+)?([^\s#:'\"][^#:]*?)\s*(?=:(?:\s|$))", "function", 1),
+                   (r"^(?:---|\.\.\.)\s*$|^\s*-(?=\s)", "keyword", 0), (r"[&*][\w-]+|!!?\w+", "type", 0)],
+        "regions": [("line", r"(?:^|(?<=\s))#.*", "comment"), ("line", _DQ, "string"),
+                    ("line", r"'[^']*'?", "string")],
+    },
+    "Lua": {
+        "exts": (".lua",),
+        "tokens": [(_NUM, "number", 0), _CALL,
+                   (_words("and break do else elseif end for function goto if in local not or repeat return "
+                           "then until while"), "keyword", 0),
+                   (_words("true false nil"), "constant", 0), (r"\bfunction\s+([\w.:]+)", "function", 1)],
+        "regions": [("block", r"--\[=*\[", r"\]=*\]", "comment"), ("line", r"--.*", "comment"),
+                    ("block", r"\[=*\[", r"\]=*\]", "string"), ("line", _DQ, "string"), ("line", _SQ, "string")],
+    },
+    "Minecraft function": {
+        "exts": (".mcfunction",),
+        "tokens": [(r"[~^]-?\d*\.?\d*|-?\b\d+(?:\.\d+)?[bsldf]?\b", "number", 0),
+                   (r"([A-Za-z_]\w*)\s*(?=:)", "function", 1),
+                   (r"\b[a-z0-9_.-]+:[a-z0-9_/.-]+", "type", 0),
+                   (_words("as at positioned rotated facing align anchored in if unless store result success "
+                           "run entity block blocks score matches predicate function data storage dimension "
+                           "biome loaded on summon"), "keyword", 0),
+                   (r"^\s*\$?([a-z_]+)", "keyword", 1), (r"@[aeprsn](?:\[[^\]]*\])?", "constant", 0),
+                   (r"\$\(\w+\)", "type", 0), (_words("true false"), "constant", 0)],
+        "regions": [("line", r"^\s*#.*", "comment"), ("line", _DQ, "string"), ("line", _SQ, "string")],
+    },
+    "Diff / patch": {
+        "exts": (".diff", ".patch", ".rej"),
+        "tokens": [(r"^\+.*", "string", 0), (r"^-.*", "constant", 0), (r"^@@.*", "keyword", 0),
+                   (r"^(?:diff |index |--- |\+\+\+ ).*", "type", 0)],
+        "regions": [],
+    },
+}
+LANGUAGES["JavaScript / TypeScript"]["regions"].insert(0, ("block", r"`", r"`", "string"))  # template strings
+LANGUAGE_NAMES = sorted(LANGUAGES, key=str.lower)
+_COMPILED_LANGS = {}
+
+
+def detect_language(filename, first_line=""):
+    name = (filename or "").lower()
+    base = os.path.basename(name)
+    for lang, spec in LANGUAGES.items():
+        if base in spec.get("names", ()):
+            return lang
+    ext = os.path.splitext(name)[1]
+    if ext:
+        for lang, spec in LANGUAGES.items():
+            if ext in spec["exts"]:
+                return lang
+    if first_line.startswith("#!"):
+        words = re.split(r"[\s/]+", first_line[2:].strip())
+        prog = words[-1] if words and words[0] != "usr" else ""
+        if "env" in words:
+            i = words.index("env")
+            prog = words[i + 1] if i + 1 < len(words) else ""
+        prog = re.sub(r"[\d.]+$", "", prog)
+        for lang, spec in LANGUAGES.items():
+            if prog and prog in spec.get("shebang", ()):
+                return lang
+    return None
+
+
+class _Region:
+    __slots__ = ("kind", "start", "end", "key", "state")
+
+
+def _compiled(lang):
+    if lang in _COMPILED_LANGS:
+        return _COMPILED_LANGS[lang]
+    spec = LANGUAGES[lang]
+    opt = QRegularExpression.PatternOption.CaseInsensitiveOption if spec.get("nocase") \
+        else QRegularExpression.PatternOption.NoPatternOption
+    tokens = [(QRegularExpression(p, opt), k, g) for p, k, g in spec["tokens"]]
+    regions, state = [], 0
+    for r in spec["regions"]:
+        reg = _Region()
+        reg.kind, reg.key = r[0], r[-1]
+        reg.start = QRegularExpression(r[1], opt)
+        reg.end = QRegularExpression(r[2], opt) if r[0] == "block" else None
+        if r[0] == "block":
+            state += 1
+            reg.state = state
+        else:
+            reg.state = 0
+        regions.append(reg)
+    for rx, _k, _g in tokens:
+        assert rx.isValid(), (lang, rx.pattern(), rx.errorString())
+    for reg in regions:
+        assert reg.start.isValid() and (reg.end is None or reg.end.isValid()), (lang, reg.start.pattern())
+    _COMPILED_LANGS[lang] = (tokens, regions, {r.state: r for r in regions if r.state})
+    return _COMPILED_LANGS[lang]
+
+
+class Highlighter(QSyntaxHighlighter):
+    def __init__(self, doc, app):
+        super().__init__(doc)
+        self.app = app
+        self.lang = None
+        self.compiled = None
+        self.formats = {}
+        self.update_formats()
+
+    def update_formats(self):
+        t = self.app.theme
+        for key in SYN_KEYS:
+            f = QTextCharFormat()
+            f.setForeground(QColor(t["syn_" + key]))
+            if key == "comment":
+                f.setFontItalic(True)
+            self.formats[key] = f
+
+    def set_language(self, lang):
+        if lang == self.lang:
+            return
+        self.lang = lang
+        self.compiled = _compiled(lang) if lang else None
+        self.rehighlight()
+
+    def highlightBlock(self, text):
+        if self.compiled is None:
+            return
+        tokens, regions, by_state = self.compiled
+        n = utf16_len(text)
+        fmt = self.formats
+        for rx, key, grp in tokens:
+            it = rx.globalMatch(text)
+            while it.hasNext():
+                m = it.next()
+                ln = m.capturedLength(grp)
+                if ln > 0:
+                    self.setFormat(m.capturedStart(grp), ln, fmt[key])
+        self.setCurrentBlockState(0)
+        pos = 0
+        prev = self.previousBlockState()
+        if prev > 0 and prev in by_state:
+            reg = by_state[prev]
+            m = reg.end.match(text, 0)
+            if m.hasMatch():
+                pos = m.capturedEnd()
+                self.setFormat(0, pos, fmt[reg.key])
+            else:
+                self.setFormat(0, n, fmt[reg.key])
+                self.setCurrentBlockState(prev)
+                return
+        while pos < n:
+            best, best_m = None, None
+            for reg in regions:
+                m = reg.start.match(text, pos)
+                if m.hasMatch() and (best_m is None or m.capturedStart() < best_m.capturedStart()):
+                    best, best_m = reg, m
+            if best is None:
+                break
+            s = best_m.capturedStart()
+            if best.kind == "line":
+                e = max(best_m.capturedEnd(), s + 1)
+                self.setFormat(s, e - s, fmt[best.key])
+                pos = e
+            else:
+                m2 = best.end.match(text, best_m.capturedEnd())
+                if m2.hasMatch():
+                    e = m2.capturedEnd()
+                    self.setFormat(s, e - s, fmt[best.key])
+                    pos = e
+                else:
+                    self.setFormat(s, n - s, fmt[best.key])
+                    self.setCurrentBlockState(best.state)
+                    return
+
+
+# --------------------------------------------------------------------------
 # The editor widget
 # --------------------------------------------------------------------------
 
@@ -1413,6 +1787,7 @@ class Editor(QPlainTextEdit):
         self.viewport().setAutoFillBackground(False)
         self.setCursorWidth(0)  # we draw our own cursor (line or block, blinking or not)
         self.gutter = Gutter(self)
+        self.highlighter = Highlighter(self.document(), app)
         self.match_selections = []
         self._blink_on = True
         self._last_cursor_rect = QRect()
@@ -1452,6 +1827,9 @@ class Editor(QPlainTextEdit):
         pal.setColor(pal.ColorRole.Highlight, QColor(t["selection_bg"]))
         pal.setColor(pal.ColorRole.HighlightedText, QColor(t["selection_fg"]))
         self.setPalette(pal)
+        self.highlighter.update_formats()
+        if self.highlighter.lang:
+            self.app.quiet_rehighlight(self.highlighter)
         self.refresh_extra()
         self.viewport().update()
         self.gutter.update()
@@ -2026,6 +2404,8 @@ class Tab:
         self.newline = app.settings["default_newline"]
         self.version = 0
         self.suggested_name = None  # name chosen with "Rename" before the file is first saved
+        self.lang_override = None   # None = detect from the file name, "" = plain text, else a language
+        self.language = None
         app.untitled_counter += 1
         self.untitled_no = app.untitled_counter
         self.editor = Editor(app, self)
@@ -2035,6 +2415,8 @@ class Tab:
         self.close_btn = TabCloseButton(self)
 
     def _changed(self):
+        if self.app.rehighlighting:
+            return  # recolouring text is not an edit
         self.version += 1
         self.app.on_text_change(self)
 
@@ -2059,6 +2441,20 @@ class Tab:
     def content(self):
         return self.editor.document().toRawText().replace(" ", "\n")
 
+    BIG_FILE = 2 * 1024 * 1024
+
+    def detected_language(self):
+        if self.lang_override is not None:
+            return self.lang_override or None
+        first = self.editor.document().firstBlock().text()[:200]
+        return detect_language(self.path or self.title(), first)
+
+    def apply_language(self):
+        self.language = self.detected_language()
+        on = (self.app.settings["syntax_highlighting"] and self.language
+              and self.editor.document().characterCount() < self.BIG_FILE)
+        self.app.set_highlight(self.editor.highlighter, self.language if on else None)
+
     def set_content(self, text):
         ed = self.editor
         ed.setPlainText(text)
@@ -2068,6 +2464,7 @@ class Tab:
         c = ed.textCursor()
         c.movePosition(OP.Start)
         ed.setTextCursor(c)
+        self.apply_language()
 
 
 # --------------------------------------------------------------------------
@@ -2588,6 +2985,7 @@ class PrefsDialog(Dialog):
         self.section(right, "DISPLAY")
         self.toggle(right, "Line numbers", "line_numbers")
         self.toggle(right, "Highlight current line", "highlight_line")
+        self.toggle(right, "Syntax colors", "syntax_highlighting")
         self.toggle(right, "Block cursor", "block_cursor")
         self.toggle(right, "Blinking cursor", "cursor_blink")
         self.number(right, "Cursor width", "cursor_width")
@@ -2876,6 +3274,7 @@ class App:
         self._showing_error = False
         self._resize_cursor = False
         self._quitting = False
+        self.rehighlighting = False
         self._no_save = False
         self._update_result = None
         self._update_busy = False
@@ -3183,7 +3582,8 @@ class App:
         self.st_indent = tool("Spaces: 4", self._indent_menu, name="statusbtn", tip="Indentation")
         self.st_eol = tool("LF", self._eol_menu, name="statusbtn", tip="Line endings")
         self.st_enc = tool("UTF-8", self._enc_menu, name="statusbtn", tip="File encoding")
-        for b in (self.st_zoom, self.st_indent, self.st_eol, self.st_enc):
+        self.st_lang = tool("Plain text", self._lang_menu, name="statusbtn", tip="Language (for syntax colors)")
+        for b in (self.st_zoom, self.st_indent, self.st_eol, self.st_enc, self.st_lang):
             h.addWidget(b)
 
     def _popup(self, widget, fill):
@@ -3333,7 +3733,7 @@ class App:
         vm = mb.addMenu("View")
         for key, text, sc in (("wrap", "Word wrap", "Alt+Z"), ("line_numbers", "Line numbers", None),
                               ("highlight_line", "Highlight current line", None),
-                              ("status_bar", "Status bar", None)):
+                              ("status_bar", "Status bar", None), ("syntax_highlighting", "Syntax colors", None)):
             self.checks[key] = A(vm, text, lambda v, k=key: self.set_setting(k, bool(v)), sc,
                                  checkable=True, checked=s[key])
         vm.addSeparator()
@@ -3497,6 +3897,10 @@ class App:
             self.apply_setting("editor_opacity")
         elif key == "status_bar":
             self.status.setVisible(self.settings["status_bar"])
+        elif key == "syntax_highlighting":
+            for t in self.tabs:
+                t.apply_language()
+            self.update_status()
         elif key in ("default_newline", "restore_session", "monospace_only", "theme"):
             pass
         else:
@@ -3850,6 +4254,7 @@ class App:
             return "Windows doesn't allow names ending in a dot or space."
         if not tab.path:
             tab.suggested_name = new
+            tab.apply_language()
             self.refresh_tab(tab)
             self.update_title()
             return None
@@ -3865,6 +4270,7 @@ class App:
             return "Couldn't rename: %s" % (ex.strerror or ex)
         old = tab.path
         tab.path = os.path.abspath(dst)
+        tab.apply_language()
         self.settings["recent"] = [tab.path if os.path.normcase(p) == os.path.normcase(old) else p
                                    for p in self.settings["recent"]]
         self.update_session()
@@ -3975,6 +4381,12 @@ class App:
         s = self.settings
         self.st_enc.setText("UTF-8 BOM" if (tab.encoding == "UTF-8" and tab.bom) else tab.encoding)
         self.st_eol.setText(tab.newline)
+        if tab.language and not self.settings["syntax_highlighting"]:
+            self.st_lang.setText(tab.language + " (colors off)")
+        elif tab.language and tab.editor.highlighter.lang is None:
+            self.st_lang.setText(tab.language + " (too big to color)")
+        else:
+            self.st_lang.setText(tab.language or "Plain text")
         self.st_indent.setText(("Spaces: %d" if s["insert_spaces"] else "Tab size: %d") % s["tab_width"])
         self.st_zoom.setText("Zoom %+d" % self.zoom_delta)
         self.st_zoom.setVisible(bool(self.zoom_delta))
@@ -4123,6 +4535,7 @@ class App:
             return False
         tab.path = os.path.abspath(path)
         tab.set_modified(False)
+        tab.apply_language()
         self.refresh_tab(tab)
         self.add_recent(tab.path)
         self.update_session()
@@ -4167,6 +4580,46 @@ class App:
             self.settings["window_state"] = bytes(self.win.saveGeometry().toBase64()).decode("ascii")
         except Exception:
             pass
+
+    # ---- syntax colours
+    def quiet_rehighlight(self, hl):
+        self.rehighlighting = True
+        try:
+            hl.rehighlight()
+        finally:
+            self.rehighlighting = False
+
+    def set_highlight(self, hl, lang):
+        self.rehighlighting = True
+        try:
+            hl.set_language(lang)
+        finally:
+            self.rehighlighting = False
+
+    def set_language(self, tab, lang):
+        tab.lang_override = lang
+        tab.apply_language()
+        self.update_status()
+
+    def _lang_menu(self):
+        tab = self.current
+        if not tab:
+            return
+
+        def fill(m):
+            g = QActionGroup(m)
+            choices = [("Auto-detect (%s)" % (tab.language or "plain text") if tab.lang_override is not None
+                        else "Auto-detect", None), ("Plain text", "")] + [(n, n) for n in LANGUAGE_NAMES]
+            for i, (text, val) in enumerate(choices):
+                a = m.addAction(text)
+                a.setCheckable(True)
+                a.setChecked(tab.lang_override == val)
+                g.addAction(a)
+                a.triggered.connect(lambda *_, v=val: self.set_language(tab, v))
+                if i == 1:
+                    m.addSeparator()
+
+        self._popup(self.st_lang, fill)
 
     # ---- install / uninstall / updates
     def _refresh_install_label(self):
