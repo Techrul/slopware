@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -2996,6 +2996,7 @@ class App:
         self.tabbar.setUsesScrollButtons(True)
         self.tabbar.setElideMode(Qt.TextElideMode.ElideNone)
         self.tabbar.setDrawBase(False)
+        self.tabbar.setCursor(Qt.CursorShape.PointingHandCursor)  # tabs are clickable, so show the hand
         self.tabbar.currentChanged.connect(self._tab_changed)
         self.tabbar.tabMoved.connect(self._tab_moved)
         self.tabbar.tabBarDoubleClicked.connect(lambda i: self.new_tab() if i < 0 else self.rename_tab(self.tabs[i]))
