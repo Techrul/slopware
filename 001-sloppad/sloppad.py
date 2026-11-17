@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -478,6 +478,10 @@ class PosConverter:
 SCRIPT_PATH = os.path.realpath(__file__)
 UPDATE_URL = (os.environ.get("SLOPPAD_UPDATE_URL")
               or "https://raw.githubusercontent.com/Techrul/slopware/main/001-sloppad/sloppad.py")
+# raw.githubusercontent.com caches files for up to 5 minutes, so right after a push it can still hand
+# out the old version. GitHub's API is always fresh, so ask it first and fall back to a cache-busted
+# raw link (the API allows 60 requests an hour per IP, which is plenty for this).
+UPDATE_API_URL = "https://api.github.com/repos/Techrul/slopware/contents/001-sloppad/sloppad.py?ref=main"
 WIN_PROGID = "SlopPad.TextFile"
 OPEN_WITH_EXTS = (".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".csv", ".json", ".xml", ".yaml", ".yml",
                   ".toml", ".py", ".pyw", ".js", ".ts", ".html", ".css", ".lua", ".sh", ".bat", ".ps1",
@@ -877,12 +881,26 @@ def check_update(timeout=10):
     """Returns {"status": "newer" | "current" | "error", "latest": str, "text": str, "error": str}."""
     import urllib.error
     import urllib.request
+    if os.environ.get("SLOPPAD_UPDATE_URL"):
+        sources = [(UPDATE_URL, {})]
+    else:
+        sources = [(UPDATE_API_URL, {"Accept": "application/vnd.github.raw"}),
+                   (UPDATE_URL + "?nocache=%d" % int(time.time()), {})]
     try:
-        req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "SlopPad/" + VERSION,
-                                                          "Cache-Control": "no-cache"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = r.read(5 * 1024 * 1024)
-        text = data.decode("utf-8")
+        text, last_error = None, None
+        for url, extra in sources:
+            headers = {"User-Agent": "SlopPad/" + VERSION, "Cache-Control": "no-cache"}
+            headers.update(extra)
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+                    text = r.read(5 * 1024 * 1024).decode("utf-8")
+                if _parse_version(text):
+                    break
+            except (urllib.error.URLError, UnicodeDecodeError) as e:
+                last_error = e
+            text = None
+        if text is None:
+            raise last_error or ValueError("No update source answered.")
         latest = _parse_version(text)
         if not latest:
             return {"status": "error", "error": "The file on GitHub has no version number in it."}
@@ -998,7 +1016,7 @@ def run_cli(argv):
         print("\n".join(out))
         return 0
     if a in ("--check-update", "--update"):
-        print("Checking %s ..." % UPDATE_URL)
+        print("Checking GitHub for updates...")
         res = check_update()
         if res["status"] == "error":
             print("Update check failed: " + res["error"])
