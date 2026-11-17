@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -897,14 +897,22 @@ def apply_update(text, force=False):
     """Replace this file with the downloaded one. Keeps a backup as sloppad.py.bak."""
     if not re.search(r'^APP_NAME = "SlopPad"', text, re.M):
         raise ValueError("The downloaded file doesn't look like SlopPad, so nothing was changed.")
+    if getattr(sys, "frozen", False):
+        raise ValueError("This SlopPad is a bundled app, so it can't update itself. Download the new "
+                         "sloppad.py from GitHub instead.")
     compile(text, "sloppad.py", "exec")  # refuse to install something that won't even parse
     git = _git_checkout_dir()
     if git and not force:
         raise RuntimeError("This copy of SlopPad is inside a git repo (%s). Use \"git pull\" instead, "
                            "so git doesn't get confused." % git)
-    backup = SCRIPT_PATH + ".bak"
-    shutil.copy2(SCRIPT_PATH, backup)
-    atomic_write(SCRIPT_PATH, text.encode("utf-8"))
+    backup = SCRIPT_PATH + ".bak"  # same name + .bak, so sloppad.pyw -> sloppad.pyw.bak
+    try:
+        shutil.copy2(SCRIPT_PATH, backup)
+        atomic_write(SCRIPT_PATH, text.encode("utf-8"))
+    except PermissionError:
+        raise ValueError("SlopPad isn't allowed to change files in %s. Move %s to a folder you own "
+                         "(like Documents) and try again." % (os.path.dirname(SCRIPT_PATH),
+                                                             os.path.basename(SCRIPT_PATH)))
     return backup
 
 
@@ -3179,6 +3187,8 @@ class App:
         A(sm, "Preferences...", self.open_prefs, "Ctrl+,")
         A(sm, "Theme editor...", self.open_theme_editor)
         sm.addSeparator()
+        A(sm, "Check for updates...", lambda: self.check_for_updates(silent=False))
+        sm.addSeparator()
         A(sm, "Open settings folder", self.open_config_folder)
         A(sm, "Reset everything...", self.reset_settings)
         if install_supported():
@@ -3189,7 +3199,6 @@ class App:
 
         hm = mb.addMenu("Help")
         A(hm, "Keyboard shortcuts", self.show_shortcuts, "F1")
-        A(hm, "Check for updates...", lambda: self.check_for_updates(silent=False))
         A(hm, "About SlopPad", self.show_about)
 
     def fill_recent(self):
@@ -3987,7 +3996,7 @@ class App:
             return
         latest = res["latest"]
         if silent:
-            self.st_msg.setText("Update available: v%s  (Help -> Check for updates)" % latest)
+            self.st_msg.setText("Update available: v%s  (Settings -> Check for updates)" % latest)
             return
         if not self.ask("Update available", "SlopPad %s is out (you have %s). Update now?" % (latest, VERSION),
                         [("Update", True, True), ("Later", None, False)],
@@ -3995,7 +4004,7 @@ class App:
             return
         try:
             backup = apply_update(res["text"])
-        except RuntimeError as e:  # git checkout
+        except RuntimeError as e:  # git checkout (ValueError = permissions / bad download)
             if not self.ask("Use git instead?", str(e), [("Update anyway", True, False), ("Cancel", None, True)],
                             default=1):
                 return
