@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -482,7 +482,10 @@ WIN_PROGID = "SlopPad.TextFile"
 OPEN_WITH_EXTS = (".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".csv", ".json", ".xml", ".yaml", ".yml",
                   ".toml", ".py", ".pyw", ".js", ".ts", ".html", ".css", ".lua", ".sh", ".bat", ".ps1",
                   ".mcfunction", ".mcmeta", ".properties")
-CONFIG_FILES = ("settings.json", "settings.json.tmp", "settings.json.broken", "errors.log", "sloppad.ico")
+CONFIG_FILES = ("settings.json", "settings.json.tmp", "settings.json.broken", "errors.log", "sloppad.ico",
+                "update-backup.py", "update-backup.json")
+BACKUP_PATH = os.path.join(CONFIG_DIR, "update-backup.py")
+BACKUP_INFO = os.path.join(CONFIG_DIR, "update-backup.json")
 
 ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <rect x="2" y="2" width="60" height="60" rx="12" fill="#000" stroke="#8b6cff" stroke-width="4"/>
@@ -905,15 +908,48 @@ def apply_update(text, force=False):
     if git and not force:
         raise RuntimeError("This copy of SlopPad is inside a git repo (%s). Use \"git pull\" instead, "
                            "so git doesn't get confused." % git)
-    backup = SCRIPT_PATH + ".bak"  # same name + .bak, so sloppad.pyw -> sloppad.pyw.bak
+    # The backup lives in the settings folder (not next to sloppad.py) and is deleted automatically
+    # once the new version has started up fine. See cleanup_after_update().
+    backup = BACKUP_PATH
     try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
         shutil.copy2(SCRIPT_PATH, backup)
+        with open(BACKUP_INFO, "w", encoding="utf-8") as f:
+            json.dump({"from": VERSION, "to": _parse_version(text), "script": SCRIPT_PATH,
+                       "time": time.time()}, f)
         atomic_write(SCRIPT_PATH, text.encode("utf-8"))
     except PermissionError:
         raise ValueError("SlopPad isn't allowed to change files in %s. Move %s to a folder you own "
                          "(like Documents) and try again." % (os.path.dirname(SCRIPT_PATH),
                                                              os.path.basename(SCRIPT_PATH)))
     return backup
+
+
+def cleanup_after_update():
+    """Run once SlopPad has started fine. Deletes the update backup (and old-style .bak files).
+    Returns the version we updated from, if this was the first start after an update."""
+    updated_from = None
+    try:
+        with open(BACKUP_INFO, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        info = None
+    if isinstance(info, dict) and info.get("to") == VERSION:
+        updated_from = info.get("from")
+        for p in (BACKUP_PATH, BACKUP_INFO):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    legacy = SCRIPT_PATH + ".bak"  # v0.3.0/0.3.1 kept the backup next to the script
+    try:
+        with open(legacy, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(4096)
+        if 'APP_NAME = "SlopPad"' in head:
+            os.remove(legacy)
+    except OSError:
+        pass
+    return updated_from
 
 
 # ---- command line
@@ -981,7 +1017,8 @@ def run_cli(argv):
             if "git" in str(e):
                 print("(Add --force to update anyway.)")
             return 1
-        print("Updated to %s! Your old version was saved as %s" % (res["latest"], backup))
+        print("Updated to %s! Your old version is backed up at %s\n"
+              "That backup is deleted automatically once the new version starts up fine." % (res["latest"], backup))
         return 0
     return None
 
@@ -1883,6 +1920,7 @@ class Tab:
         self.encoding, self.bom = "UTF-8", False
         self.newline = app.settings["default_newline"]
         self.version = 0
+        self.suggested_name = None  # name chosen with "Rename" before the file is first saved
         app.untitled_counter += 1
         self.untitled_no = app.untitled_counter
         self.editor = Editor(app, self)
@@ -1896,7 +1934,9 @@ class Tab:
         self.app.on_text_change(self)
 
     def title(self):
-        return os.path.basename(self.path) if self.path else "Untitled-%d" % self.untitled_no
+        if self.path:
+            return os.path.basename(self.path)
+        return self.suggested_name or "Untitled-%d" % self.untitled_no
 
     def is_modified(self):
         try:
@@ -2744,6 +2784,7 @@ class App:
 
         self.restore_window()
         self.qapp.installEventFilter(self._filter_obj())
+        QTimer.singleShot(8000, self._post_start_cleanup)
         if self.settings["check_updates"] and time.time() - self.settings["last_update_check"] > 20 * 3600:
             QTimer.singleShot(2500, lambda: self.check_for_updates(silent=True))
         if self.settings.load_error:
@@ -2957,7 +2998,7 @@ class App:
         self.tabbar.setDrawBase(False)
         self.tabbar.currentChanged.connect(self._tab_changed)
         self.tabbar.tabMoved.connect(self._tab_moved)
-        self.tabbar.tabBarDoubleClicked.connect(lambda i: self.new_tab() if i < 0 else None)
+        self.tabbar.tabBarDoubleClicked.connect(lambda i: self.new_tab() if i < 0 else self.rename_tab(self.tabs[i]))
         self.tabbar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabbar.customContextMenuRequested.connect(self._tab_menu)
         th.addWidget(self.tabbar)
@@ -3121,6 +3162,7 @@ class App:
         A(fm, "Save", lambda: self.save_tab(self.current), "Ctrl+S")
         A(fm, "Save as...", lambda: self.save_tab(self.current, save_as=True), "Ctrl+Shift+S")
         A(fm, "Save all", self.save_all)
+        A(fm, "Rename...", lambda: self.rename_tab(self.current), "F2")
         fm.addSeparator()
         A(fm, "Close tab", lambda: self.close_tab(self.current), "Ctrl+W")
         A(fm, "Quit", self.win.close, "Ctrl+Q")
@@ -3592,16 +3634,117 @@ class App:
         i = self.tabbar.tabAt(pos)
         if i < 0:
             return
-        tab = self.tabs[i]
+        self._show_tab_menu(self.tabs[i], self.tabbar.mapToGlobal(pos))
+
+    def tab_menu_actions(self, tab):
+        """(label, callback, enabled) rows for a tab's right-click menu; None = separator."""
+        saved = bool(tab.path)
+        i = self._tab_index(tab)
+        return [
+            ("Rename...", lambda: self.rename_tab(tab), True),
+            ("Save", lambda: self.save_tab(tab), True),
+            ("Save as...", lambda: self.save_tab(tab, save_as=True), True),
+            ("Reload from disk", lambda: (self.select_tab(tab), self.reload_current()), saved),
+            None,
+            ("Close", lambda: self.close_tab(tab), True),
+            ("Close others", lambda: self.close_others(tab), len(self.tabs) > 1),
+            ("Close tabs to the right", lambda: self.close_right_of(tab), i < len(self.tabs) - 1),
+            ("Close all", self.close_all, True),
+            None,
+            ("Copy path", lambda: self.copy_text(tab.path or ""), saved),
+            ("Copy file name", lambda: self.copy_text(tab.title()), True),
+            ("Open containing folder", lambda: open_in_file_manager(os.path.dirname(tab.path)), saved),
+        ]
+
+    def _show_tab_menu(self, tab, global_pos):
         m = QMenu(self.win)
-        m.addAction("Close", lambda: self.close_tab(tab))
-        m.addAction("Close others", lambda: self.close_others(tab))
-        m.addSeparator()
-        a = m.addAction("Copy path", lambda: self.copy_text(tab.path or ""))
-        a.setEnabled(bool(tab.path))
-        a = m.addAction("Open containing folder", lambda: open_in_file_manager(os.path.dirname(tab.path)))
-        a.setEnabled(bool(tab.path))
-        m.exec(self.tabbar.mapToGlobal(pos))
+        for row in self.tab_menu_actions(tab):
+            if row is None:
+                m.addSeparator()
+                continue
+            text, fn, enabled = row
+            a = m.addAction(text)
+            a.setEnabled(enabled)
+            a.triggered.connect(lambda *_, fn=fn: fn())
+        m.exec(global_pos)
+
+    def rename_tab(self, tab):
+        if tab is None:
+            return
+        d = Dialog(self, "Rename")
+        d.setModal(True)
+        d.body.addWidget(label("New name for this file:" if tab.path
+                               else "Name for this tab (it's used when you save):", "dim"))
+        e = QLineEdit(tab.title())
+        e.setMinimumWidth(340)
+        d.body.addWidget(e)
+        err = label("", "error", wrap=True)
+        err.hide()
+        d.body.addWidget(err)
+        stem = os.path.splitext(tab.title())[0]
+        e.setSelection(0, len(stem))  # like Explorer/Dolphin: keep the extension unselected
+
+        def go():
+            msg = self.do_rename(tab, e.text().strip())
+            if msg:
+                err.setText(msg)
+                err.show()
+                return
+            d.accept()
+
+        e.returnPressed.connect(go)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(button("Cancel", d.reject))
+        row.addWidget(button("Rename", go, accent=True))
+        d.body.addLayout(row)
+        e.setFocus()
+        d.exec()
+
+    def do_rename(self, tab, new):
+        """Returns an error message, or None when it worked."""
+        bad = r'[\\/:*?"<>|]' if IS_WIN else r"/"
+        if not new or new in (".", ".."):
+            return "Type a name."
+        if re.search(bad, new) or "\0" in new:
+            return "Names can't contain %s" % (' \\ / : * ? " < > |' if IS_WIN else "/")
+        if IS_WIN and new.rstrip(". ") != new:
+            return "Windows doesn't allow names ending in a dot or space."
+        if not tab.path:
+            tab.suggested_name = new
+            self.refresh_tab(tab)
+            self.update_title()
+            return None
+        if new == os.path.basename(tab.path):
+            return None
+        dst = os.path.join(os.path.dirname(tab.path), new)
+        same_file = os.path.normcase(dst) == os.path.normcase(tab.path)  # case-only rename on Windows
+        if os.path.exists(dst) and not same_file:
+            return '"%s" already exists in that folder.' % new
+        try:
+            os.rename(tab.path, dst)
+        except OSError as ex:
+            return "Couldn't rename: %s" % (ex.strerror or ex)
+        old = tab.path
+        tab.path = os.path.abspath(dst)
+        self.settings["recent"] = [tab.path if os.path.normcase(p) == os.path.normcase(old) else p
+                                   for p in self.settings["recent"]]
+        self.update_session()
+        self.refresh_tab(tab)
+        self.update_title()
+        self.flash("Renamed to %s" % new)
+        return None
+
+    def close_right_of(self, tab):
+        i = self._tab_index(tab)
+        for t in list(self.tabs[i + 1:]):
+            if not self.close_tab(t):
+                break
+
+    def close_all(self):
+        for t in list(self.tabs):
+            if not self.close_tab(t):
+                break
 
     def cycle_tab(self, d):
         if len(self.tabs) > 1 and self.current in self.tabs:
@@ -3819,7 +3962,7 @@ class App:
             return False
         path = tab.path
         if save_as or not path:
-            start = path or os.path.join(self._last_dir(), "untitled.txt")
+            start = path or os.path.join(self._last_dir(), tab.suggested_name or "untitled.txt")
             path, _ = QFileDialog.getSaveFileName(self.win, "Save as", start)
             if not path:
                 return False
@@ -4000,7 +4143,7 @@ class App:
             return
         if not self.ask("Update available", "SlopPad %s is out (you have %s). Update now?" % (latest, VERSION),
                         [("Update", True, True), ("Later", None, False)],
-                        detail="Your current version is kept as sloppad.py.bak, just in case."):
+                        detail="A backup of your current version is kept until the new one starts up fine."):
             return
         try:
             backup = apply_update(res["text"])
@@ -4018,8 +4161,17 @@ class App:
             return
         if self.ask("Updated to %s!" % latest, "Restart SlopPad now to use the new version?",
                     [("Restart", True, True), ("Later", None, False)],
-                    detail="Old version saved as " + backup):
+                    detail="Your old version is backed up at " + backup):
             self.restart()
+
+    def _post_start_cleanup(self):
+        try:
+            old = cleanup_after_update()
+        except Exception:
+            old = None
+        if old:
+            self.flash("Updated from v%s to v%s \u2713" % (old, VERSION))
+            self.flash_timer.start(8000)
 
     def restart(self):
         if not self.confirm_quit():
@@ -4066,6 +4218,9 @@ class App:
             box.setPlainText("SlopPad %s | Python %s | PySide6 %s | %s\n\n%s" % (
                 VERSION, platform.python_version(), pyside_version, platform.platform(), text))
             d.body.addWidget(box)
+            if os.path.exists(BACKUP_PATH):
+                d.body.addWidget(label("Broke right after an update? Your previous version is at %s - copy it over "
+                                       "%s to roll back." % (BACKUP_PATH, SCRIPT_PATH), "dim", wrap=True))
             row = QHBoxLayout()
             row.addWidget(label("Also saved to " + LOG_PATH, "dim"))
             row.addStretch(1)
