@@ -24,16 +24,20 @@ import json
 import os
 import platform
 import re
+import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
+import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -239,6 +243,8 @@ DEFAULT_SETTINGS = {
     "recent": [],
     "window_state": "",
     "monospace_only": True,
+    "check_updates": False,
+    "last_update_check": 0.0,
 }
 
 NUMERIC_LIMITS = {
@@ -466,8 +472,17 @@ class PosConverter:
 
 
 # --------------------------------------------------------------------------
-# Linux launcher (works without Qt installed)
+# Install / uninstall / updates (all of this works without Qt installed)
 # --------------------------------------------------------------------------
+
+SCRIPT_PATH = os.path.realpath(__file__)
+UPDATE_URL = (os.environ.get("SLOPPAD_UPDATE_URL")
+              or "https://raw.githubusercontent.com/Techrul/slopware/main/001-sloppad/sloppad.py")
+WIN_PROGID = "SlopPad.TextFile"
+OPEN_WITH_EXTS = (".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".csv", ".json", ".xml", ".yaml", ".yml",
+                  ".toml", ".py", ".pyw", ".js", ".ts", ".html", ".css", ".lua", ".sh", ".bat", ".ps1",
+                  ".mcfunction", ".mcmeta", ".properties")
+CONFIG_FILES = ("settings.json", "settings.json.tmp", "settings.json.broken", "errors.log", "sloppad.ico")
 
 ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <rect x="2" y="2" width="60" height="60" rx="12" fill="#000" stroke="#8b6cff" stroke-width="4"/>
@@ -479,6 +494,104 @@ ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 """
 
 
+# ---- icon as .ico (drawn pixel by pixel, no image libraries needed)
+
+def _in_rrect(px, py, x, y, w, h, r):
+    if px < x or py < y or px > x + w or py > y + h:
+        return False
+    cx = min(max(px, x + r), x + w - r)
+    cy = min(max(py, y + r), y + h - r)
+    return (px - cx) ** 2 + (py - cy) ** 2 <= r * r
+
+
+_ICON_ACC, _ICON_LIGHT, _ICON_BLACK = (0x8b, 0x6c, 0xff), (0xc9, 0xbc, 0xff), (0, 0, 0)
+
+
+def _icon_color(u, v):
+    if _in_rrect(u, v, 14, 16, 36, 6, 3):
+        return _ICON_ACC
+    for y, w in ((28, 28), (37, 32), (46, 18)):
+        if _in_rrect(u, v, 14, y, w, 4, 2):
+            return _ICON_LIGHT
+    if _in_rrect(u, v, 4, 4, 56, 56, 10):
+        return _ICON_BLACK
+    if _in_rrect(u, v, 0, 0, 64, 64, 14):
+        return _ICON_ACC
+    return None
+
+
+def render_icon_png(size):
+    scale = 64.0 / size
+    samples = ((0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75))
+    raw = bytearray()
+    for py in range(size):
+        raw.append(0)  # PNG filter: none
+        for px in range(size):
+            r = g = b = n = 0
+            for ox, oy in samples:
+                c = _icon_color((px + ox) * scale, (py + oy) * scale)
+                if c:
+                    r, g, b, n = r + c[0], g + c[1], b + c[2], n + 1
+            if n:
+                raw += bytes((r // n, g // n, b // n, 255 * n // 4))
+            else:
+                raw += b"\0\0\0\0"
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+
+
+def make_ico_bytes(sizes=(16, 24, 32, 48, 64, 256)):
+    pngs = [(s, render_icon_png(s)) for s in sizes]
+    out = struct.pack("<HHH", 0, 1, len(pngs))
+    offset = 6 + 16 * len(pngs)
+    data = b""
+    for s, png in pngs:
+        dim = 0 if s >= 256 else s
+        out += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(png), offset + len(data))
+        data += png
+    return out + data
+
+
+# ---- shared helpers
+
+def _git_checkout_dir():
+    d = os.path.dirname(SCRIPT_PATH)
+    for _ in range(5):
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _run_quiet(cmd, **kw):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, **kw)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _remove(path, out):
+    try:
+        os.remove(path)
+        out.append("Removed " + path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        out.append("Couldn't remove %s (%s)" % (path, e))
+        return False
+
+
+# ---- Linux
+
 def _linux_paths():
     data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return (os.path.join(data, "applications", "sloppad.desktop"),
@@ -486,13 +599,12 @@ def _linux_paths():
             os.path.join(data, "applications"))
 
 
-def install_launcher():
-    """Linux: add SlopPad to the app menu and to 'Open With' for text files."""
-    if not IS_LINUX:
-        print("--install is for Linux. On Windows, rename the file to sloppad.pyw and "
-              "double-click it (or make a shortcut to it).")
-        return 1
-    script = os.path.realpath(__file__)
+def _linux_refresh(apps_dir):
+    for cmd in (["update-desktop-database", apps_dir], ["kbuildsycoca6"], ["kbuildsycoca5"]):
+        _run_quiet(cmd)
+
+
+def _linux_install(out):
     desktop, icon, apps_dir = _linux_paths()
     os.makedirs(os.path.dirname(desktop), exist_ok=True)
     os.makedirs(os.path.dirname(icon), exist_ok=True)
@@ -510,41 +622,302 @@ def install_launcher():
             "Terminal=false\n"
             "Categories=Utility;TextEditor;\n"
             "MimeType=text/plain;text/x-python;text/markdown;application/json;application/x-shellscript;\n"
-            "StartupWMClass=sloppad\n" % (sys.executable, script))
+            "StartupWMClass=sloppad\n" % (sys.executable, SCRIPT_PATH))
     try:
-        os.chmod(script, os.stat(script).st_mode | 0o111)
+        os.chmod(SCRIPT_PATH, os.stat(SCRIPT_PATH).st_mode | 0o111)
     except OSError:
         pass
-    for cmd in (["update-desktop-database", apps_dir], ["kbuildsycoca6"], ["kbuildsycoca5"]):
+    _linux_refresh(apps_dir)
+    out.append("SlopPad is now in your app launcher (it may take a moment to show up).")
+    out.append("Right-click any text file -> Open With -> SlopPad.")
+    out.append("Launcher: " + desktop)
+    return True
+
+
+def _linux_clean_mimeapps(out):
+    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    for path in (os.path.join(cfg, "mimeapps.list"), os.path.join(data, "applications", "mimeapps.list")):
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            pass
-    print("Installed! SlopPad is now in your app launcher.\n"
-          "  Launcher: %s\n  Icon:     %s\n"
-          "Right-click any text file -> Open With -> SlopPad.\n"
-          "If you move sloppad.py later, run --install again.\n"
-          "Remove it with: python3 sloppad.py --uninstall" % (desktop, icon))
-    return 0
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        new, changed = [], False
+        for line in lines:
+            if "=" in line and not line.lstrip().startswith(("[", "#")):
+                key, val = line.split("=", 1)
+                items = [i for i in val.strip().split(";") if i]
+                kept = [i for i in items if i != "sloppad.desktop"]
+                if len(kept) != len(items):
+                    changed = True
+                    if kept:
+                        new.append("%s=%s;\n" % (key, ";".join(kept)))
+                    continue
+            new.append(line)
+        if changed:
+            atomic_write(path, "".join(new).encode("utf-8"))
+            out.append("Removed SlopPad from default apps in " + path)
 
 
-def uninstall_launcher():
-    if not IS_LINUX:
-        print("Nothing to uninstall on this OS.")
-        return 0
+def _linux_uninstall(out):
     desktop, icon, apps_dir = _linux_paths()
-    for p in (desktop, icon):
-        try:
-            os.remove(p)
-            print("Removed " + p)
-        except FileNotFoundError:
-            pass
+    _remove(desktop, out)
+    _remove(icon, out)
+    _linux_clean_mimeapps(out)
+    _linux_refresh(apps_dir)
+
+
+# ---- Windows
+
+def _win_paths():
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    lnk = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "SlopPad.lnk")
+    return lnk, os.path.join(CONFIG_DIR, "sloppad.ico")
+
+
+def _pythonw():
+    cand = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return cand if os.path.isfile(cand) else sys.executable
+
+
+def _win_notify():
     try:
-        subprocess.run(["update-desktop-database", apps_dir], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=30)
-    except (OSError, subprocess.SubprocessError):
+        import ctypes
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)  # SHCNE_ASSOCCHANGED
+    except Exception:
         pass
-    return 0
+
+
+def _win_install(out):
+    import winreg
+    lnk, ico = _win_paths()
+    os.makedirs(os.path.dirname(ico), exist_ok=True)
+    with open(ico, "wb") as f:
+        f.write(make_ico_bytes())
+    pyw = _pythonw()
+    ok = True
+
+    # Start Menu shortcut (paths go through env vars so no quoting can break the command)
+    os.makedirs(os.path.dirname(lnk), exist_ok=True)
+    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SP_LNK);"
+          "$s.TargetPath=$env:SP_TARGET;$s.Arguments=$env:SP_ARGS;$s.IconLocation=$env:SP_ICON;"
+          "$s.WorkingDirectory=$env:SP_DIR;$s.Description='SlopPad text editor';$s.Save()")
+    env = dict(os.environ, SP_LNK=lnk, SP_TARGET=pyw, SP_ARGS='"%s"' % SCRIPT_PATH,
+               SP_ICON=ico + ",0", SP_DIR=os.path.dirname(SCRIPT_PATH))
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                            "-Command", ps], env=env, capture_output=True, text=True, timeout=60,
+                           creationflags=0x08000000)  # CREATE_NO_WINDOW
+        err = (r.stderr or "").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        err = str(e)
+    if os.path.exists(lnk):
+        out.append("Added SlopPad to the Start Menu.")
+    else:
+        ok = False
+        out.append("Couldn't create the Start Menu shortcut: " + (err or "unknown error"))
+
+    # "Open with" entries (current user only, no admin needed)
+    cmd = '"%s" "%s" "%%1"' % (pyw, SCRIPT_PATH)
+    base = "Software\\Classes\\" + WIN_PROGID
+    HK = winreg.HKEY_CURRENT_USER
+
+    def setv(path, name, value):
+        with winreg.CreateKey(HK, path) as k:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+
+    setv(base, "", "SlopPad text file")
+    setv(base, "FriendlyTypeName", "SlopPad text file")
+    setv(base + "\\DefaultIcon", "", ico + ",0")
+    setv(base + "\\Application", "ApplicationName", "SlopPad")
+    setv(base + "\\Application", "ApplicationIcon", ico + ",0")
+    setv(base + "\\shell\\open", "FriendlyAppName", "SlopPad")
+    setv(base + "\\shell\\open", "Icon", ico + ",0")
+    setv(base + "\\shell\\open\\command", "", cmd)
+    for ext in OPEN_WITH_EXTS:
+        with winreg.CreateKey(HK, "Software\\Classes\\%s\\OpenWithProgids" % ext) as k:
+            winreg.SetValueEx(k, WIN_PROGID, 0, winreg.REG_NONE, b"")
+    _win_notify()
+    out.append("SlopPad now shows up in \"Open with\" for %d file types (.txt, .md, .json, ...)."
+               % len(OPEN_WITH_EXTS))
+    return ok
+
+
+def _win_delete_tree(winreg, root, path):
+    try:
+        with winreg.OpenKey(root, path, 0, winreg.KEY_READ | winreg.KEY_WRITE) as k:
+            while True:
+                try:
+                    sub = winreg.EnumKey(k, 0)
+                except OSError:
+                    break
+                _win_delete_tree(winreg, root, path + "\\" + sub)
+        winreg.DeleteKey(root, path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _win_key_empty(winreg, root, path):
+    try:
+        with winreg.OpenKey(root, path) as k:
+            n_sub, n_val, _ = winreg.QueryInfoKey(k)
+            return n_sub == 0 and n_val == 0
+    except FileNotFoundError:
+        return False
+
+
+def _win_uninstall(out):
+    import winreg
+    HK = winreg.HKEY_CURRENT_USER
+    lnk, ico = _win_paths()
+    _remove(lnk, out)
+    _remove(ico, out)
+    if _win_delete_tree(winreg, HK, "Software\\Classes\\" + WIN_PROGID):
+        out.append("Removed SlopPad's file type from the registry.")
+    removed = 0
+    for ext in OPEN_WITH_EXTS:
+        sub = "Software\\Classes\\%s\\OpenWithProgids" % ext
+        try:
+            with winreg.OpenKey(HK, sub, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, WIN_PROGID)
+                removed += 1
+        except FileNotFoundError:
+            continue
+        for path in (sub, "Software\\Classes\\" + ext):  # tidy up keys only if we left them empty
+            if _win_key_empty(winreg, HK, path):
+                try:
+                    winreg.DeleteKey(HK, path)
+                except OSError:
+                    pass
+    for ext in OPEN_WITH_EXTS:  # Explorer's own per-user copy of the list
+        sub = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\%s\\OpenWithProgids" % ext
+        try:
+            with winreg.OpenKey(HK, sub, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, WIN_PROGID)
+        except OSError:
+            pass
+    if removed:
+        out.append("Removed SlopPad from \"Open with\" for %d file types." % removed)
+    _win_notify()
+
+
+# ---- public install / uninstall
+
+def is_installed():
+    if IS_LINUX:
+        return os.path.exists(_linux_paths()[0])
+    if IS_WIN:
+        return os.path.exists(_win_paths()[0])
+    return False
+
+
+def install_supported():
+    return IS_LINUX or IS_WIN
+
+
+def install(out):
+    """Add SlopPad to the app menu / Start Menu and to "Open with". Returns True on success."""
+    try:
+        if IS_LINUX:
+            return _linux_install(out)
+        if IS_WIN:
+            return _win_install(out)
+    except Exception as e:
+        out.append("Install failed: %s" % e)
+        return False
+    out.append("Nothing to install on macOS - just run sloppad.py.")
+    return False
+
+
+def uninstall(out, remove_settings=False, remove_program=False):
+    """Undo install(). Optionally also delete settings/themes/logs and the program file itself."""
+    try:
+        if IS_LINUX:
+            _linux_uninstall(out)
+        elif IS_WIN:
+            _win_uninstall(out)
+    except Exception as e:
+        out.append("Couldn't fully remove the launcher: %s" % e)
+    if remove_settings:
+        for name in CONFIG_FILES:
+            _remove(os.path.join(CONFIG_DIR, name), out)
+        try:
+            os.rmdir(CONFIG_DIR)
+            out.append("Removed " + CONFIG_DIR)
+        except OSError:
+            pass
+    if remove_program:
+        git = _git_checkout_dir()
+        if git:
+            out.append("Kept sloppad.py because it's inside a git repo (%s). Delete it with git if you want." % git)
+        else:
+            _remove(SCRIPT_PATH + ".bak", out)
+            _remove(SCRIPT_PATH, out)
+    if not out:
+        out.append("Nothing to remove - SlopPad wasn't installed.")
+
+
+# ---- updates
+
+def _parse_version(text):
+    m = re.search(r'^VERSION = "(\d+(?:\.\d+)*)"', text, re.M)
+    return m.group(1) if m else None
+
+
+def _vtuple(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def check_update(timeout=10):
+    """Returns {"status": "newer" | "current" | "error", "latest": str, "text": str, "error": str}."""
+    import urllib.error
+    import urllib.request
+    try:
+        req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "SlopPad/" + VERSION,
+                                                          "Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read(5 * 1024 * 1024)
+        text = data.decode("utf-8")
+        latest = _parse_version(text)
+        if not latest:
+            return {"status": "error", "error": "The file on GitHub has no version number in it."}
+        status = "newer" if _vtuple(latest) > _vtuple(VERSION) else "current"
+        return {"status": status, "latest": latest, "text": text}
+    except urllib.error.HTTPError as e:
+        return {"status": "error", "error": "GitHub answered with error %d." % e.code}
+    except urllib.error.URLError as e:
+        return {"status": "error", "error": "Couldn't reach GitHub (%s). Are you online?" % e.reason}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def apply_update(text, force=False):
+    """Replace this file with the downloaded one. Keeps a backup as sloppad.py.bak."""
+    if not re.search(r'^APP_NAME = "SlopPad"', text, re.M):
+        raise ValueError("The downloaded file doesn't look like SlopPad, so nothing was changed.")
+    compile(text, "sloppad.py", "exec")  # refuse to install something that won't even parse
+    git = _git_checkout_dir()
+    if git and not force:
+        raise RuntimeError("This copy of SlopPad is inside a git repo (%s). Use \"git pull\" instead, "
+                           "so git doesn't get confused." % git)
+    backup = SCRIPT_PATH + ".bak"
+    shutil.copy2(SCRIPT_PATH, backup)
+    atomic_write(SCRIPT_PATH, text.encode("utf-8"))
+    return backup
+
+
+# ---- command line
+
+def _ask_yes(question):
+    if not sys.stdin or not sys.stdin.isatty():
+        return False
+    try:
+        return input(question + " [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
 
 
 def run_cli(argv):
@@ -553,18 +926,55 @@ def run_cli(argv):
         return None
     a = argv[0]
     if a in ("-h", "--help"):
-        print("usage: sloppad.py [file ...]\n"
-              "       sloppad.py --install     add SlopPad to your Linux app menu / Open With\n"
-              "       sloppad.py --uninstall   remove that again\n\n"
+        print("usage: sloppad.py [file ...]\n\n"
+              "  --install         add SlopPad to your app menu / Start Menu and to \"Open with\"\n"
+              "  --uninstall       remove that again (asks about settings and the program file)\n"
+              "  --uninstall --all remove everything: launcher, settings, custom themes, and sloppad.py\n"
+              "  --check-update    see if there's a newer version on GitHub\n"
+              "  --update          download and install the newer version\n"
+              "  --version         print the version\n\n"
               "A vibe-coded text editor. Part of slopware: " + REPO_URL)
         return 0
     if a in ("-V", "--version"):
         print("%s %s" % (APP_NAME, VERSION))
         return 0
     if a == "--install":
-        return install_launcher()
+        out = []
+        ok = install(out)
+        print("\n".join(out))
+        if ok:
+            print("If you move sloppad.py later, run --install again.")
+        return 0 if ok else 1
     if a == "--uninstall":
-        return uninstall_launcher()
+        everything = "--all" in argv[1:]
+        rs = everything or _ask_yes("Also delete your settings, custom themes and error log?")
+        rp = everything or _ask_yes("Also delete the program file itself (%s)?" % SCRIPT_PATH)
+        out = []
+        uninstall(out, remove_settings=rs, remove_program=rp)
+        print("\n".join(out))
+        return 0
+    if a in ("--check-update", "--update"):
+        print("Checking %s ..." % UPDATE_URL)
+        res = check_update()
+        if res["status"] == "error":
+            print("Update check failed: " + res["error"])
+            return 1
+        if res["status"] == "current":
+            print("You're up to date (%s %s)." % (APP_NAME, VERSION))
+            return 0
+        print("Version %s is available (you have %s)." % (res["latest"], VERSION))
+        if a == "--check-update":
+            print("Run with --update to install it.")
+            return 0
+        try:
+            backup = apply_update(res["text"], force="--force" in argv[1:])
+        except Exception as e:
+            print("Update failed: %s" % e)
+            if "git" in str(e):
+                print("(Add --force to update anyway.)")
+            return 1
+        print("Updated to %s! Your old version was saved as %s" % (res["latest"], backup))
+        return 0
     return None
 
 
@@ -1874,7 +2284,7 @@ class MainWindow(QWidget):
         self.setAcceptDrops(True)
 
     def closeEvent(self, e):
-        if self.app.confirm_quit():
+        if self.app._quitting or self.app.confirm_quit():
             e.accept()
         else:
             e.ignore()
@@ -2010,6 +2420,7 @@ class PrefsDialog(Dialog):
         self.controls["default_newline"] = dd
         self.row(right, "New file line endings", dd)
         self.toggle(right, "Reopen files on startup", "restore_session")
+        self.toggle(right, "Check for updates on startup", "check_updates")
         for g in (left, right):
             g.setRowStretch(self._rows[id(g)], 1)
 
@@ -2284,6 +2695,10 @@ class App:
         self._mono = None
         self._showing_error = False
         self._resize_cursor = False
+        self._quitting = False
+        self._no_save = False
+        self._update_result = None
+        self._update_busy = False
         self.theme = self.resolve_theme(self.settings["theme"])
 
         self.setup_fonts()
@@ -2321,6 +2736,8 @@ class App:
 
         self.restore_window()
         self.qapp.installEventFilter(self._filter_obj())
+        if self.settings["check_updates"] and time.time() - self.settings["last_update_check"] > 20 * 3600:
+            QTimer.singleShot(2500, lambda: self.check_for_updates(silent=True))
         if self.settings.load_error:
             QTimer.singleShot(300, lambda: self.error(
                 "Settings were reset", "Your settings file couldn't be read, so SlopPad started fresh.",
@@ -2764,9 +3181,15 @@ class App:
         sm.addSeparator()
         A(sm, "Open settings folder", self.open_config_folder)
         A(sm, "Reset everything...", self.reset_settings)
+        if install_supported():
+            sm.addSeparator()
+            self.install_action = A(sm, "Add to app menu / Open with...", self.gui_install)
+            A(sm, "Uninstall SlopPad...", self.gui_uninstall)
+            sm.aboutToShow.connect(self._refresh_install_label)
 
         hm = mb.addMenu("Help")
         A(hm, "Keyboard shortcuts", self.show_shortcuts, "F1")
+        A(hm, "Check for updates...", lambda: self.check_for_updates(silent=False))
         A(hm, "About SlopPad", self.show_about)
 
     def fill_recent(self):
@@ -2897,6 +3320,8 @@ class App:
             self.save_timer.start(700)
 
     def save_settings(self):
+        if self._no_save:
+            return
         try:
             self.settings.save()
         except Exception as e:
@@ -3452,6 +3877,153 @@ class App:
             self.settings["window_state"] = bytes(self.win.saveGeometry().toBase64()).decode("ascii")
         except Exception:
             pass
+
+    # ---- install / uninstall / updates
+    def _refresh_install_label(self):
+        a = getattr(self, "install_action", None)
+        if a is not None:
+            a.setText("Repair app menu / Open with..." if is_installed() else "Add to app menu / Open with...")
+
+    def gui_install(self):
+        where = "Start Menu" if IS_WIN else "app launcher"
+        if not self.ask("Add SlopPad to your system?",
+                        "This adds SlopPad to your %s and to \"Open with\" for text files." % where,
+                        [("Add it", True, True), ("Cancel", None, False)],
+                        detail="Only your user account is changed (no admin needed). You can undo it any time "
+                               "with Settings -> Uninstall SlopPad. If you move sloppad.py later, do this again."):
+            return
+        out = []
+        ok = install(out)
+        (self.info if ok else self.error)("Done!" if ok else "Something went wrong", "\n".join(out))
+
+    def gui_uninstall(self):
+        d = Dialog(self, "Uninstall SlopPad")
+        d.setModal(True)
+        head = label("Uninstall SlopPad?")
+        head.setStyleSheet("font-weight: bold;")
+        d.body.addWidget(head)
+        d.body.addWidget(label("This removes SlopPad from your %s and from \"Open with\"."
+                               % ("Start Menu" if IS_WIN else "app launcher"), "dim", wrap=True))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        t_set = Toggle(self, False)
+        t_prog = Toggle(self, False)
+        grid.addWidget(label("Also delete settings, custom themes and the error log"), 0, 0)
+        grid.addWidget(t_set, 0, 1)
+        grid.addWidget(label("Also delete the program file (sloppad.py)"), 1, 0)
+        grid.addWidget(t_prog, 1, 1)
+        d.body.addLayout(grid)
+        git = _git_checkout_dir()
+        if git:
+            t_prog.setEnabled(False)
+            d.body.addWidget(label("sloppad.py is inside a git repo, so it won't be deleted from here.",
+                                   "dim", wrap=True))
+        d.body.addWidget(label("Custom themes you didn't export will be gone for good if you delete settings.",
+                               "dim", wrap=True))
+        choice = {"go": False}
+
+        def go():
+            choice["go"] = True
+            d.accept()
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(button("Cancel", d.reject))
+        row.addWidget(button("Uninstall", go, accent=True))
+        d.body.addSpacing(8)
+        d.body.addLayout(row)
+        d.exec()
+        if not choice["go"]:
+            return
+        rs, rp = t_set.isChecked(), t_prog.isChecked() and not git
+        out = []
+        uninstall(out, remove_settings=rs, remove_program=rp)
+        if rs or rp:
+            self._no_save = rs
+            self.info("SlopPad uninstalled", "\n".join(out),
+                      detail="SlopPad will close now." + ("" if rp else " Delete sloppad.py whenever you like."))
+            if self.confirm_quit():
+                self._quitting = True
+                self.qapp.quit()
+        else:
+            self.info("Removed from your system", "\n".join(out),
+                      detail="SlopPad itself still works - run it again any time.")
+
+    def check_for_updates(self, silent=False):
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self._update_result = None
+        if not silent:
+            self.flash("Checking for updates...")
+
+        def work():
+            self._update_result = check_update()
+
+        threading.Thread(target=work, daemon=True).start()
+        poll = QTimer(self.win)
+
+        def tick():
+            if self._update_result is None:
+                return
+            poll.stop()
+            poll.deleteLater()
+            self._update_busy = False
+            self._on_update_result(self._update_result, silent)
+
+        poll.timeout.connect(tick)
+        poll.start(150)
+
+    def _on_update_result(self, res, silent):
+        self.settings["last_update_check"] = time.time()
+        self.save_settings_soon()
+        if res["status"] == "error":
+            if not silent:
+                self.error("Couldn't check for updates", res["error"])
+            return
+        if res["status"] == "current":
+            if not silent:
+                self.info("You're up to date", "SlopPad %s is the newest version." % VERSION)
+            return
+        latest = res["latest"]
+        if silent:
+            self.st_msg.setText("Update available: v%s  (Help -> Check for updates)" % latest)
+            return
+        if not self.ask("Update available", "SlopPad %s is out (you have %s). Update now?" % (latest, VERSION),
+                        [("Update", True, True), ("Later", None, False)],
+                        detail="Your current version is kept as sloppad.py.bak, just in case."):
+            return
+        try:
+            backup = apply_update(res["text"])
+        except RuntimeError as e:  # git checkout
+            if not self.ask("Use git instead?", str(e), [("Update anyway", True, False), ("Cancel", None, True)],
+                            default=1):
+                return
+            try:
+                backup = apply_update(res["text"], force=True)
+            except Exception as e2:
+                self.error("Update failed", str(e2))
+                return
+        except Exception as e:
+            self.error("Update failed", str(e), detail="Nothing was changed.")
+            return
+        if self.ask("Updated to %s!" % latest, "Restart SlopPad now to use the new version?",
+                    [("Restart", True, True), ("Later", None, False)],
+                    detail="Old version saved as " + backup):
+            self.restart()
+
+    def restart(self):
+        if not self.confirm_quit():
+            return
+        args = [sys.executable, SCRIPT_PATH]
+        if not self.settings["restore_session"]:
+            args += [t.path for t in self.tabs if t.path]
+        try:
+            subprocess.Popen(args, close_fds=True)
+        except OSError as e:
+            self.error("Couldn't restart", str(e), detail="Start SlopPad again yourself.")
+        self._quitting = True
+        self.qapp.quit()
 
     # ---- errors
     def _log(self, text):
