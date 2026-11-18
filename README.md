@@ -8,3 +8,9 @@ No lol, I'll try and link good alternatives for each thing, they should be much 
 Like everything, all I do is prompting and writing the README unless I get particularly lazy.
 # Which AI are you using?
 Claude :)
+
+# Software
+
+| Thing a ling | What it is | Alternatives |
+| --- | --- | --- |
+|[sloppad](https://github.com/Techrul/slopware/blob/main/001-sloppad/sloppad.py)| Notepad/text editor | Whatever's built-in, [Notepad++](https://notepad-plus-plus.org/), [Notepads (Windows only)](https://www.notepadsapp.com/), [Kate](https://kate-editor.org/)|
