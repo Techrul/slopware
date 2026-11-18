@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -232,6 +232,43 @@ def complete_theme(colors):
     return out
 
 
+# Catppuccin (https://catppuccin.com) - official palette, mapped the way their style guide suggests
+_CATPPUCCIN = {
+    "Mocha": "1e1e2e 181825 11111b 313244 45475a 585b70 6c7086 7f849c 9399b2 cdd6f4 bac2de "
+             "f5e0dc b4befe cba6f7 f38ba8 fab387 f9e2af a6e3a1 94e2d5 89b4fa",
+    "Macchiato": "24273a 1e2030 181926 363a4f 494d64 5b6078 6e738d 8087a2 939ab7 cad3f5 b8c0e0 "
+                 "f4dbd6 b7bdf8 c6a0f6 ed8796 f5a97f eed49f a6da95 8bd5ca 8aadf4",
+    "Frappé": "303446 292c3c 232634 414559 51576d 626880 737994 838ba7 949cbb c6d0f5 b5bfe2 "
+              "f2d5cf babbf1 ca9ee6 e78284 ef9f76 e5c890 a6d189 81c8be 8caaee",
+    "Latte": "eff1f5 e6e9ef dce0e8 ccd0da bcc0cc acb0be 9ca0b0 8c8fa1 7c7f93 4c4f69 5c5f77 "
+             "dc8a78 7287fd 8839ef d20f39 fe640b df8e1d 40a02b 179299 1e66f5",
+}
+_CTP_NAMES = ("base mantle crust surface0 surface1 surface2 overlay0 overlay1 overlay2 text subtext1 "
+              "rosewater lavender mauve red peach yellow green teal blue").split()
+
+
+def _catppuccin_theme(flavor):
+    c = dict(zip(_CTP_NAMES, ("#" + h for h in _CATPPUCCIN[flavor].split())))
+    light = flavor == "Latte"
+    return {
+        "bg": c["base"], "fg": c["text"], "cursor": c["rosewater"],
+        "selection_bg": blend(c["base"], c["overlay2"], 0.30), "selection_fg": c["text"],
+        "current_line": blend(c["base"], c["surface0"], 0.55),
+        "gutter_bg": c["base"], "gutter_fg": c["overlay0"], "gutter_active": c["lavender"],
+        "match_bg": blend(c["base"], c["yellow"], 0.28), "current_match_bg": c["peach"],
+        "ui_bg": c["mantle"], "ui_fg": c["subtext1"], "ui_dim": c["overlay1"], "ui_hover": c["surface0"],
+        "input_bg": c["base"] if light else c["crust"], "accent": c["mauve"], "border": c["crust"],
+        "tab_active_bg": c["base"], "tab_active_fg": c["text"],
+        "scrollbar": c["surface1"], "scrollbar_hover": c["surface2"],
+        "syn_keyword": c["mauve"], "syn_string": c["green"], "syn_comment": c["overlay2"],
+        "syn_number": c["peach"], "syn_function": c["blue"], "syn_type": c["yellow"], "syn_constant": c["red"],
+    }
+
+
+for _flavor in ("Mocha", "Macchiato", "Frappé", "Latte"):
+    BUILTIN_THEMES["Catppuccin " + _flavor] = _catppuccin_theme(_flavor)
+
+
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
@@ -269,6 +306,7 @@ DEFAULT_SETTINGS = {
     "hot_exit": True,
     "auto_reload": True,
     "bracket_matching": True,
+    "plus_next_to_tabs": True,
     "last_update_check": 0.0,
 }
 
@@ -3176,6 +3214,7 @@ class PrefsDialog(Dialog):
         self.section(right, "INTERFACE")
         self.number(right, "UI font size", "ui_font_size")
         self.toggle(right, "Use editor font for UI", "ui_use_editor_font")
+        self.toggle(right, "New tab button next to tabs", "plus_next_to_tabs")
         dd = DropButton(["LF", "CRLF"], s["default_newline"], lambda v: app.set_setting("default_newline", v), 90)
         self.controls["default_newline"] = dd
         self.row(right, "New file line endings", dd)
@@ -3733,8 +3772,9 @@ class App:
         self.tabbar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabbar.customContextMenuRequested.connect(self._tab_menu)
         th.addWidget(self.tabbar)
-        th.addStretch(1)
-        th.addWidget(IconButton(self, "plus", self.new_tab, "New tab (Ctrl+N)", width=38))
+        self.tabrow_layout = th
+        self.plus_btn = IconButton(self, "plus", self.new_tab, "New tab (Ctrl+N)", width=38)
+        self.arrange_plus()
         lay.addWidget(tabrow)
         lay.addWidget(sep())
 
@@ -3747,6 +3787,21 @@ class App:
         self.status.setVisible(self.settings["status_bar"])
         self.build_menus()
         self.titlebar.set_frameless(self.frameless)
+
+    def arrange_plus(self):
+        """Put the + right after the last tab, or at the far right edge (Preferences)."""
+        lay = self.tabrow_layout
+        while lay.count() > 1:  # keep the tab bar, re-add the rest
+            item = lay.takeAt(1)
+            if item.widget() is not None:
+                item.widget().setParent(None)
+        if self.settings["plus_next_to_tabs"]:
+            lay.addWidget(self.plus_btn)
+            lay.addStretch(1)
+        else:
+            lay.addStretch(1)
+            lay.addWidget(self.plus_btn)
+        self.plus_btn.show()
 
     def build_status(self):
         st = self.status = QWidget()
@@ -4096,6 +4151,8 @@ class App:
             for t in self.tabs:
                 t.apply_language()
             self.update_status()
+        elif key == "plus_next_to_tabs":
+            self.arrange_plus()
         elif key == "bracket_matching":
             for t in self.tabs:
                 t.editor.refresh_extra()
