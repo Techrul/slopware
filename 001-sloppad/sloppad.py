@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -266,6 +266,9 @@ DEFAULT_SETTINGS = {
     "monospace_only": True,
     "check_updates": False,
     "syntax_highlighting": True,
+    "hot_exit": True,
+    "auto_reload": True,
+    "bracket_matching": True,
     "last_update_check": 0.0,
 }
 
@@ -511,6 +514,8 @@ OPEN_WITH_EXTS = (".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".csv", ".json
 CONFIG_FILES = ("settings.json", "settings.json.tmp", "settings.json.broken", "errors.log", "sloppad.ico",
                 "update-backup.py", "update-backup.json")
 BACKUP_PATH = os.path.join(CONFIG_DIR, "update-backup.py")
+SESSION_DIR = os.path.join(CONFIG_DIR, "session")
+SESSION_FILE = os.path.join(SESSION_DIR, "session.json")
 BACKUP_INFO = os.path.join(CONFIG_DIR, "update-backup.json")
 
 ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
@@ -870,6 +875,9 @@ def uninstall(out, remove_settings=False, remove_program=False):
     except Exception as e:
         out.append("Couldn't fully remove the launcher: %s" % e)
     if remove_settings:
+        if os.path.isdir(SESSION_DIR):
+            shutil.rmtree(SESSION_DIR, ignore_errors=True)
+            out.append("Removed remembered tabs in " + SESSION_DIR)
         for name in CONFIG_FILES:
             _remove(os.path.join(CONFIG_DIR, name), out)
         try:
@@ -1070,6 +1078,7 @@ if __name__ == "__main__":
 
 try:
     from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QRegularExpression, QSize, Qt, QTimer
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QFontMetricsF,
                                QIcon, QIntValidator, QKeySequence, QPainter, QPen, QPixmap,
                                QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextFormat)
@@ -1596,6 +1605,13 @@ LANGUAGES = {
 }
 LANGUAGES["JavaScript / TypeScript"]["regions"].insert(0, ("block", r"`", r"`", "string"))  # template strings
 LANGUAGE_NAMES = sorted(LANGUAGES, key=str.lower)
+COMMENT_STYLES = {
+    "Python": "#", "Shell": "#", "YAML": "#", "Config (INI / TOML)": "#", "PowerShell": "#",
+    "Minecraft function": "#", "JavaScript / TypeScript": "//", "JSON": "//", "C / C++": "//",
+    "Java / Kotlin": "//", "C#": "//", "Rust": "//", "Go": "//", "Lua": "--", "Batch": "REM",
+    "CSS": ("/*", "*/"), "HTML / XML": ("<!--", "-->"), "Markdown": ("<!--", "-->"),
+}
+BRACKETS = {"(": ")", "[": "]", "{": "}", ")": "(", "]": "[", "}": "{"}
 _COMPILED_LANGS = {}
 
 
@@ -1975,7 +1991,150 @@ class Editor(QPlainTextEdit):
             s.cursor = c
             sels.append(s)
         sels.extend(self.match_selections)
+        sels.extend(self._bracket_selections())
         self.setExtraSelections(sels)
+
+    # ---- matching brackets
+    def _skip_ranges(self, block):
+        """Spans (UTF-16) colored as string/comment in this line, so brackets there are ignored."""
+        t = self.app.theme
+        skip = {QColor(t["syn_string"]).name(), QColor(t["syn_comment"]).name()}
+        out = []
+        for r in block.layout().formats():
+            if r.format.foreground().color().name() in skip:
+                out.append((r.start, r.start + r.length))
+        return out
+
+    def _bracket_selections(self):
+        if not self.app.settings["bracket_matching"]:
+            return []
+        c = self.textCursor()
+        if c.hasSelection():
+            return []
+        block = c.block()
+        text = block.text()
+        i = len(self._left_text(c))
+        for idx in (i, i - 1):
+            if 0 <= idx < len(text) and text[idx] in BRACKETS:
+                match = self._find_bracket(block, idx)
+                if match:
+                    color = qcolor(self.app.theme["accent"], 95)
+                    sels = []
+                    for blk, k in ((block, idx), match):
+                        sel = QTextEdit.ExtraSelection()
+                        cur = QTextCursor(self.document())
+                        pos = blk.position() + utf16_len(blk.text()[:k])
+                        cur.setPosition(pos)
+                        cur.setPosition(pos + 1, KEEP)
+                        sel.cursor = cur
+                        sel.format.setBackground(color)
+                        sels.append(sel)
+                    return sels
+        return []
+
+    def _find_bracket(self, block, idx, budget=30000):
+        text = block.text()
+        ch = text[idx]
+        target = BRACKETS[ch]
+        forward = ch in "([{"
+        use_skip = self.highlighter.lang is not None
+        cache = {}
+
+        def in_skip(blk, k):
+            if not use_skip:
+                return False
+            key = blk.blockNumber()
+            if key not in cache:
+                cache[key] = self._skip_ranges(blk)
+            u = utf16_len(blk.text()[:k])
+            return any(a <= u < b for a, b in cache[key])
+
+        start_skipped = in_skip(block, idx)
+        depth = 0
+        blk, t, k = block, text, idx
+        while blk.isValid():
+            rng = range(k, len(t)) if forward else range(k, -1, -1)
+            for j in rng:
+                x = t[j]
+                if x == ch or x == target:
+                    if start_skipped or not in_skip(blk, j):
+                        depth += 1 if x == ch else -1
+                        if depth == 0:
+                            return blk, j
+                budget -= 1
+                if budget <= 0:
+                    return None
+            blk = blk.next() if forward else blk.previous()
+            if not blk.isValid():
+                return None
+            t = blk.text()
+            k = 0 if forward else len(t) - 1
+        return None
+
+    # ---- comments
+    def toggle_comment(self):
+        lang = self.tab.language
+        style = COMMENT_STYLES.get(lang)
+        if not style:
+            self.app.flash("No comment style for %s" % (lang or "plain text"))
+            return
+        a, b, had = self.sel_lines()
+        doc = self.document()
+        blocks = [doc.findBlockByNumber(n) for n in range(a, b + 1)]
+        lines = [blk.text() for blk in blocks]
+        filled = [ln for ln in lines if ln.strip()]
+        if not filled:
+            return
+        block_style = isinstance(style, tuple)
+
+        def is_commented(ln):
+            st = ln.strip()
+            if block_style:
+                return st.startswith(style[0]) and st.endswith(style[1]) and len(st) >= len(style[0]) + len(style[1])
+            if style.isalpha():  # REM
+                return st.upper() == style or st.upper().startswith(style + " ")
+            return st.startswith(style)
+
+        uncomment = all(is_commented(ln) for ln in filled)
+        indent = min(len(ln) - len(ln.lstrip()) for ln in filled)
+        new_lines = []
+        for ln in lines:
+            if not ln.strip():
+                new_lines.append(ln)
+                continue
+            lead = ln[:len(ln) - len(ln.lstrip())]
+            if uncomment:
+                st = ln.strip()
+                if block_style:
+                    body = st[len(style[0]):len(st) - len(style[1])]
+                    body = body[1:] if body.startswith(" ") else body
+                    body = body[:-1] if body.endswith(" ") else body
+                else:
+                    body = st[len(style):]
+                    body = body[1:] if body.startswith(" ") else body
+                new_lines.append(lead + body + ln[len(ln.rstrip()):] if not block_style else lead + body)
+            elif block_style:
+                new_lines.append(ln[:indent] + style[0] + " " + ln[indent:] + " " + style[1])
+            else:
+                new_lines.append(ln[:indent] + style + " " + ln[indent:])
+        cur = self.textCursor()
+        col = cur.positionInBlock()
+        line_no = cur.blockNumber()
+        c = QTextCursor(doc)
+        c.beginEditBlock()
+        c.setPosition(blocks[0].position())
+        last = blocks[-1]
+        c.setPosition(last.position() + last.length() - 1, KEEP)
+        c.insertText("\n".join(new_lines))
+        c.endEditBlock()
+        if had or a != b:
+            self.select_lines(a, b)
+        else:
+            delta = utf16_len(new_lines[line_no - a]) - utf16_len(lines[line_no - a])
+            blk = doc.findBlockByNumber(line_no)
+            c = QTextCursor(doc)
+            c.setPosition(blk.position() + max(0, min(blk.length() - 1, col + delta)))
+            self.setTextCursor(c)
 
     # ---- input
     def wheelEvent(self, e):
@@ -2406,6 +2565,9 @@ class Tab:
         self.suggested_name = None  # name chosen with "Rename" before the file is first saved
         self.lang_override = None   # None = detect from the file name, "" = plain text, else a language
         self.language = None
+        self.disk_stat = None       # (mtime_ns, size) of the file when we last read/wrote it
+        self.session_id = "%x%x" % (int(time.time() * 1000), id(self))
+        self.snap_version = None    # tab.version when its unsaved text was last written to the session
         app.untitled_counter += 1
         self.untitled_no = app.untitled_counter
         self.editor = Editor(app, self)
@@ -2442,6 +2604,25 @@ class Tab:
         return self.editor.document().toRawText().replace(" ", "\n")
 
     BIG_FILE = 2 * 1024 * 1024
+
+    def record_disk_stat(self):
+        try:
+            st = os.stat(self.path)
+            self.disk_stat = (st.st_mtime_ns, st.st_size)
+        except (OSError, TypeError):
+            self.disk_stat = None
+
+    def disk_changed(self):
+        """None = unchanged, "deleted", or "changed"."""
+        if not self.path or self.disk_stat is None:
+            return None
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return "deleted"
+        except OSError:
+            return None
+        return None if (st.st_mtime_ns, st.st_size) == self.disk_stat else "changed"
 
     def detected_language(self):
         if self.lang_override is not None:
@@ -2981,6 +3162,7 @@ class PrefsDialog(Dialog):
         self.number(right, "Tab width", "tab_width")
         self.toggle(right, "Indent with spaces", "insert_spaces")
         self.toggle(right, "Auto-indent", "auto_indent")
+        self.toggle(right, "Highlight matching brackets", "bracket_matching")
         self.toggle(right, "Word wrap", "wrap")
         self.section(right, "DISPLAY")
         self.toggle(right, "Line numbers", "line_numbers")
@@ -2998,6 +3180,8 @@ class PrefsDialog(Dialog):
         self.controls["default_newline"] = dd
         self.row(right, "New file line endings", dd)
         self.toggle(right, "Reopen files on startup", "restore_session")
+        self.toggle(right, "Remember unsaved tabs on close", "hot_exit")
+        self.toggle(right, "Reload files changed by other programs", "auto_reload")
         self.toggle(right, "Check for updates on startup", "check_updates")
         for g in (left, right):
             g.setRowStretch(self._rows[id(g)], 1)
@@ -3275,6 +3459,8 @@ class App:
         self._resize_cursor = False
         self._quitting = False
         self.rehighlighting = False
+        self._disk_checking = False
+        self.server = None
         self._no_save = False
         self._update_result = None
         self._update_busy = False
@@ -3303,15 +3489,23 @@ class App:
         self.flash_timer.setSingleShot(True)
         self.flash_timer.timeout.connect(lambda: self.st_msg.setText(""))
 
+        self.session_timer = QTimer()
+        self.session_timer.setSingleShot(True)
+        self.session_timer.timeout.connect(self.write_session)
+        self.disk_timer = QTimer()
+        self.disk_timer.timeout.connect(self.check_disk_changes)
+
+        active = None
+        if self.settings["restore_session"] or self.settings["hot_exit"]:
+            active = self.restore_session()
         for p in files:
-            self.open_path(p)
-        if not files and self.settings["restore_session"]:
-            for p in self.settings["session"]:
-                if os.path.isfile(p):
-                    self.open_path(p, quiet=True)
+            active = self.open_path(p) or active
         if not self.tabs:
             self.new_tab()
-        self.select_tab(self.tabs[-1] if files else self.tabs[0])
+        self.select_tab(active if active in self.tabs else self.tabs[0])
+        self.disk_timer.start(2000)
+        self.qapp.applicationStateChanged.connect(
+            lambda st: self.check_disk_changes() if st == Qt.ApplicationState.ApplicationActive else None)
 
         self.restore_window()
         self.qapp.installEventFilter(self._filter_obj())
@@ -3721,6 +3915,7 @@ class App:
         A(em, "Find previous", lambda: self.findbar.step(-1), "Shift+F3")
         A(em, "Go to line...", self.goto_line, "Ctrl+G")
         em.addSeparator()
+        A(em, "Toggle comment", self._ed("toggle_comment"), ["Ctrl+/", "Ctrl+#"])
         A(em, "Duplicate line", self._ed("duplicate"), "Ctrl+D")
         A(em, "Delete line", self._ed("delete_line"), "Ctrl+Shift+K")
         A(em, "Move line up", self._ed("move_lines", -1))
@@ -3901,7 +4096,12 @@ class App:
             for t in self.tabs:
                 t.apply_language()
             self.update_status()
-        elif key in ("default_newline", "restore_session", "monospace_only", "theme"):
+        elif key == "bracket_matching":
+            for t in self.tabs:
+                t.editor.refresh_extra()
+        elif key == "hot_exit":
+            self.write_session()
+        elif key in ("default_newline", "restore_session", "monospace_only", "theme", "auto_reload"):
             pass
         else:
             for t in self.tabs:
@@ -4057,7 +4257,7 @@ class App:
             ("Close tab / Quit", M + "W  /  " + M + "Q"), ("Next / previous tab", M + "Tab  /  " + M + "Shift+Tab"),
             ("Find / Replace", M + "F  /  " + M + "H"), ("Next / previous match", "Enter / Shift+Enter  (or F3)"),
             ("Go to line", M + "G"), ("Undo / Redo", M + "Z  /  " + M + "Y"), ("Select line", M + "L"),
-            ("Duplicate line", M + "D"), ("Delete line", M + "Shift+K"),
+            ("Toggle comment", M + "/"), ("Duplicate line", M + "D"), ("Delete line", M + "Shift+K"),
             ("Move line up / down", A + "Up  /  " + A + "Down"), ("Indent / unindent", "Tab  /  Shift+Tab"),
             ("Delete word", M + "Backspace  /  " + M + "Delete"),
             ("Zoom", M + "+  /  " + M + "-  /  " + M + "0  (or " + M + "scroll)"),
@@ -4270,6 +4470,7 @@ class App:
             return "Couldn't rename: %s" % (ex.strerror or ex)
         old = tab.path
         tab.path = os.path.abspath(dst)
+        tab.record_disk_stat()
         tab.apply_language()
         self.settings["recent"] = [tab.path if os.path.normcase(p) == os.path.normcase(old) else p
                                    for p in self.settings["recent"]]
@@ -4356,6 +4557,7 @@ class App:
 
     # ---- editor events
     def on_text_change(self, tab):
+        self.schedule_session()
         if tab is self.current:
             self.status_timer.start(15)
             self.words_timer.start(400)
@@ -4422,6 +4624,7 @@ class App:
     def update_session(self):
         self.settings["session"] = [t.path for t in self.tabs if t.path]
         self.save_settings_soon()
+        self.schedule_session()
 
     def open_dialog(self):
         paths, _ = QFileDialog.getOpenFileNames(self.win, "Open", self._last_dir())
@@ -4470,6 +4673,7 @@ class App:
         tab.encoding, tab.bom = enc, bom
         tab.newline = nl or self.settings["default_newline"]
         tab.set_content(content)
+        tab.record_disk_stat()
         self.refresh_tab(tab)
         self.add_recent(path)
         if select:
@@ -4493,19 +4697,8 @@ class App:
         if tab.is_modified() and not self.ask("Reload?", "Throw away your changes and reload from disk?",
                                               [("Reload", True, True), ("Cancel", None, False)]):
             return
-        try:
-            content, enc, bom, nl = read_text_file(tab.path, force=True)
-        except OSError as e:
-            self.error("Couldn't reload", str(e))
-            return
-        pos = tab.editor.textCursor().position()
-        tab.encoding, tab.bom, tab.newline = enc, bom, nl or tab.newline
-        tab.set_content(content)
-        c = tab.editor.textCursor()
-        c.setPosition(min(pos, tab.editor.document().characterCount() - 1))
-        tab.editor.setTextCursor(c)
-        self.refresh_modified(tab)
-        self.flash("Reloaded")
+        if self.reload_tab(tab):
+            self.flash("Reloaded")
 
     def save_tab(self, tab, save_as=False):
         if tab is None:
@@ -4528,12 +4721,19 @@ class App:
                 return False
             tab.encoding, tab.bom = "UTF-8", False
             data = encode_text(content, "UTF-8", False)
+        same_file = tab.path and os.path.normcase(os.path.abspath(path)) == os.path.normcase(tab.path)
+        if same_file and tab.disk_changed() == "changed":
+            if not self.ask("Overwrite?", '"%s" was changed by another program since you opened it.' % tab.title(),
+                            [("Overwrite with mine", True, True), ("Cancel", None, False)],
+                            detail="Saving replaces their changes with yours."):
+                return False
         try:
             atomic_write(path, data)
         except OSError as e:
             self.error("Couldn't save", str(e))
             return False
         tab.path = os.path.abspath(path)
+        tab.record_disk_stat()
         tab.set_modified(False)
         tab.apply_language()
         self.refresh_tab(tab)
@@ -4580,6 +4780,216 @@ class App:
             self.settings["window_state"] = bytes(self.win.saveGeometry().toBase64()).decode("ascii")
         except Exception:
             pass
+
+    # ---- remembered tabs (hot exit)
+    def session_tabs(self, include_unsaved):
+        entries = []
+        for tab in self.tabs:
+            ed = tab.editor
+            e = {"id": tab.session_id, "path": tab.path, "cursor": ed.textCursor().position(),
+                 "scroll": ed.verticalScrollBar().value(), "encoding": tab.encoding, "bom": tab.bom,
+                 "newline": tab.newline, "lang_override": tab.lang_override,
+                 "suggested_name": tab.suggested_name, "untitled_no": tab.untitled_no,
+                 "active": tab is self.current, "disk_stat": list(tab.disk_stat) if tab.disk_stat else None}
+            dirty = tab.is_modified() or (not tab.path and not tab.is_pristine())
+            if include_unsaved and dirty and tab.editor.document().characterCount() < 20 * 1024 * 1024:
+                e["content_file"] = "tab-%s.txt" % tab.session_id
+                e["modified"] = tab.is_modified()
+                e["_tab"] = tab
+            if not tab.path and "content_file" not in e:
+                continue  # empty Untitled tabs aren't worth remembering
+            entries.append(e)
+        return entries
+
+    def write_session(self, include_unsaved=None):
+        if self._no_save:
+            return
+        hot = self.settings["hot_exit"] if include_unsaved is None else include_unsaved
+        try:
+            os.makedirs(SESSION_DIR, exist_ok=True)
+            entries = self.session_tabs(hot)
+            keep = set()
+            for e in entries:
+                tab = e.pop("_tab", None)
+                if tab is None:
+                    continue
+                keep.add(e["content_file"])
+                target = os.path.join(SESSION_DIR, e["content_file"])
+                if tab.snap_version != tab.version or not os.path.exists(target):
+                    atomic_write(target, fix_surrogates(tab.content()).encode("utf-8"))
+                    tab.snap_version = tab.version
+            atomic_write(SESSION_FILE, json.dumps({"version": 1, "tabs": entries}, indent=1).encode("utf-8"))
+            for name in os.listdir(SESSION_DIR):
+                if name.startswith("tab-") and name not in keep:
+                    try:
+                        os.remove(os.path.join(SESSION_DIR, name))
+                    except OSError:
+                        pass
+        except Exception as e:
+            self._log("Could not write session: %s" % e)
+
+    def restore_session(self):
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                entries = json.load(f).get("tabs", [])
+        except (OSError, ValueError, AttributeError):
+            entries = [{"path": pth} for pth in self.settings["session"]]  # older versions
+        active = None
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            path = e.get("path") if isinstance(e.get("path"), str) else None
+            cf = e.get("content_file")
+            tab = None
+            text = None
+            if cf and self.settings["hot_exit"]:
+                try:
+                    with open(os.path.join(SESSION_DIR, os.path.basename(cf)), "r", encoding="utf-8") as f:
+                        text = f.read()
+                except OSError:
+                    text = None
+            if text is not None:
+                tab = self.new_tab(path, select=False)
+                if isinstance(e.get("untitled_no"), int) and not path:
+                    tab.untitled_no = e["untitled_no"]
+                    self.untitled_counter = max(self.untitled_counter, tab.untitled_no)
+                tab.encoding = e.get("encoding") if e.get("encoding") in ENCODINGS else "UTF-8"
+                tab.bom = bool(e.get("bom"))
+                tab.newline = e.get("newline") if e.get("newline") in ("LF", "CRLF", "CR") else tab.newline
+                tab.suggested_name = e.get("suggested_name") if isinstance(e.get("suggested_name"), str) else None
+                lo = e.get("lang_override")
+                tab.lang_override = lo if (lo is None or lo == "" or lo in LANGUAGES) else None
+                tab.set_content(text)
+                if e.get("modified", True):
+                    tab.set_modified(True)
+                ds = e.get("disk_stat")
+                if path and isinstance(ds, list) and len(ds) == 2:
+                    tab.disk_stat = (ds[0], ds[1])  # if the file changed while we were closed, we'll ask
+                elif path:
+                    tab.record_disk_stat()
+                self.refresh_tab(tab)
+            elif path and os.path.isfile(path):
+                tab = self.open_path(path, quiet=True, select=False)
+            if tab is None:
+                continue
+            lo = e.get("lang_override")
+            if text is None and (lo == "" or lo in LANGUAGES):
+                tab.lang_override = lo
+                tab.apply_language()
+            cur, scroll = e.get("cursor"), e.get("scroll")
+            if isinstance(cur, int):
+                c = tab.editor.textCursor()
+                c.setPosition(max(0, min(cur, tab.editor.document().characterCount() - 1)))
+                tab.editor.setTextCursor(c)
+            if isinstance(scroll, int):
+                QTimer.singleShot(0, lambda ed=tab.editor, v=scroll: ed.verticalScrollBar().setValue(v))
+            if e.get("active"):
+                active = tab
+        return active
+
+    def schedule_session(self):
+        if hasattr(self, "session_timer"):
+            self.session_timer.start(2500)
+
+    # ---- files changed by other programs
+    def check_disk_changes(self):
+        if self._disk_checking or self._quitting or QApplication.activeModalWidget() is not None:
+            return
+        self._disk_checking = True
+        try:
+            for tab in list(self.tabs):
+                what = tab.disk_changed()
+                if what is None:
+                    continue
+                if what == "deleted":
+                    tab.disk_stat = None
+                    tab.set_modified(True)
+                    self.flash('"%s" was deleted or moved - save it to keep it' % tab.title())
+                    self.flash_timer.start(8000)
+                    continue
+                if not tab.is_modified() and self.settings["auto_reload"]:
+                    self.reload_tab(tab)
+                    self.flash('Reloaded "%s" (changed on disk)' % tab.title())
+                    continue
+                tab.record_disk_stat()  # only ask once per change
+                self.select_tab(tab)
+                ans = self.ask("Changed on disk", '"%s" was changed by another program.' % tab.title(),
+                               [("Keep my version", "keep", True), ("Reload from disk", "reload", False)],
+                               detail=("Reloading throws away your unsaved changes." if tab.is_modified()
+                                       else "Reload to see the new version."))
+                if ans == "reload":
+                    self.reload_tab(tab)
+        finally:
+            self._disk_checking = False
+
+    def reload_tab(self, tab):
+        try:
+            content, enc, bom, nl = read_text_file(tab.path, force=True)
+        except OSError as e:
+            self.error("Couldn't reload", str(e))
+            return False
+        ed = tab.editor
+        pos, scroll = ed.textCursor().position(), ed.verticalScrollBar().value()
+        tab.encoding, tab.bom, tab.newline = enc, bom, nl or tab.newline
+        tab.set_content(content)
+        tab.record_disk_stat()
+        c = ed.textCursor()
+        c.setPosition(min(pos, ed.document().characterCount() - 1))
+        ed.setTextCursor(c)
+        ed.verticalScrollBar().setValue(scroll)
+        self.refresh_modified(tab)
+        self.schedule_session()
+        return True
+
+    # ---- one window: a second launch hands its files to the running SlopPad
+    @staticmethod
+    def server_name():
+        import hashlib
+        return "sloppad-" + hashlib.sha1(CONFIG_DIR.encode("utf-8")).hexdigest()[:12]
+
+    def start_server(self):
+        srv = QLocalServer(self.win)
+        name = self.server_name()
+        if not srv.listen(name):
+            QLocalServer.removeServer(name)  # leftover from a crash
+            if not srv.listen(name):
+                return
+        srv.newConnection.connect(lambda: self._on_client(srv))
+        self.server = srv
+
+    def _on_client(self, srv):
+        sock = srv.nextPendingConnection()
+        if sock is None:
+            return
+        buf = bytearray()
+
+        def done():
+            try:
+                files = json.loads(bytes(buf).decode("utf-8")).get("files", [])
+            except ValueError:
+                files = []
+            sock.deleteLater()
+            self.bring_to_front()
+            if files:
+                for f in files:
+                    self.open_path(f)
+            else:
+                self.new_tab()
+
+        def read():
+            buf.extend(bytes(sock.readAll()))
+            if buf.endswith(b"\n"):
+                done()
+
+        sock.readyRead.connect(read)
+
+    def bring_to_front(self):
+        w = self.win
+        if w.isMinimized():
+            w.showNormal()
+        w.show()
+        w.raise_()
+        w.activateWindow()
 
     # ---- syntax colours
     def quiet_rehighlight(self, hl):
@@ -4826,8 +5236,9 @@ class App:
 
     # ---- quit
     def confirm_quit(self):
+        hot = self.settings["hot_exit"] and not self._no_save
         for tab in list(self.tabs):
-            if tab.is_modified():
+            if tab.is_modified() and not (hot and tab.editor.document().characterCount() < 20 * 1024 * 1024):
                 ans = self.ask_save(tab)
                 if ans is None:
                     return False
@@ -4835,7 +5246,10 @@ class App:
                     return False
         self.store_window()
         self.settings["session"] = [t.path for t in self.tabs if t.path]
+        self.write_session(include_unsaved=hot)
         self.save_settings()
+        if self.server is not None:
+            self.server.close()  # so a restart doesn't hand its files back to us
         for d in list(self.dialogs):
             d.close()
         return True
@@ -4844,13 +5258,30 @@ class App:
         return self.qapp.exec()
 
 
+def hand_off_to_running(files):
+    """If SlopPad is already open, send it our files and return True."""
+    sock = QLocalSocket()
+    sock.connectToServer(App.server_name())
+    if not sock.waitForConnected(400):
+        return False
+    payload = json.dumps({"files": [os.path.abspath(os.path.expanduser(f)) for f in files]}) + "\n"
+    sock.write(payload.encode("utf-8"))
+    sock.flush()
+    sock.waitForBytesWritten(1000)
+    sock.disconnectFromServer()
+    return True
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     code = run_cli(argv)
     if code is not None:
         return code
     qapp = QApplication(sys.argv[:1])
+    if os.environ.get("SLOPPAD_NEW_WINDOW") != "1" and hand_off_to_running(argv):
+        return 0
     app = App(argv, qapp)
+    app.start_server()
     return app.run()
 
 
