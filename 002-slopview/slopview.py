@@ -36,7 +36,7 @@ import zlib
 
 APP_NAME = "SlopView"
 APP_ID = "slopware.slopview"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -1063,15 +1063,15 @@ if __name__ == "__main__":
 
 try:
     from PySide6.QtCore import (QEvent, QFileSystemWatcher, QObject, QPoint, QPointF, QRectF, QSize, Qt,
-                                QTimer, Signal)
-    from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QFont, QFontDatabase, QIcon,
+                                QTimer, QUrl, Signal)
+    from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
                                QImage, QImageReader, QImageWriter, QIntValidator, QKeySequence, QMovie, QPainter,
-                               QPen, QPixmap, QTransform)
+                               QPen, QPixmap, QShortcut, QTransform)
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
-    from PySide6.QtWidgets import (QAbstractButton, QApplication, QColorDialog, QDialog, QFileDialog, QFrame,
+    from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication, QColorDialog, QDialog, QFileDialog, QFrame,
                                    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                    QMenuBar, QPlainTextEdit, QPushButton, QSizePolicy, QSlider, QStyle,
-                                   QStyledItemDelegate, QToolButton,
+                                   QStyledItemDelegate, QToolButton, QTreeWidget, QTreeWidgetItem,
                                    QVBoxLayout, QWidget)
     from PySide6.QtCore import QFile
 except ImportError:
@@ -2643,10 +2643,633 @@ class PrefsDialog(Dialog):
 
 
 VIEWER_STYLESHEET = """
+    QTreeWidget#metatree { background: %(input_bg)s; color: %(fg)s; border: 1px solid %(border)s;
+        border-radius: 6px; padding: 4px; outline: none; }
+    QTreeWidget#metatree::item { padding: 3px 2px; }
+    QTreeWidget#metatree::item:selected { background: %(selection_bg)s; color: %(selection_fg)s; }
+    QTreeWidget#metatree::item:hover:!selected { background: %(ui_hover)s; }
+    QHeaderView::section { background: %(ui_bg)s; color: %(ui_dim)s; border: none;
+        border-bottom: 1px solid %(border)s; padding: 4px 6px; }
     QWidget#infopanel { background: %(ui_bg)s; border-left: 1px solid %(border)s; }
     QListWidget#filmstrip { background: %(ui_bg)s; border: none; border-top: 1px solid %(border)s;
         padding: 4px 6px; outline: none; }
 """
+
+
+# --------------------------------------------------------------------------
+# Full metadata (for the Metadata window)
+# --------------------------------------------------------------------------
+
+EXIF_NAMES = {
+    # IFD0 / IFD1
+    0x0100: "Image width", 0x0101: "Image height", 0x0102: "Bits per sample", 0x0103: "Compression",
+    0x0106: "Photometric interpretation", 0x010E: "Image description", 0x010F: "Camera make",
+    0x0110: "Camera model", 0x0112: "Orientation", 0x0115: "Samples per pixel", 0x011A: "X resolution",
+    0x011B: "Y resolution", 0x011C: "Planar configuration", 0x0128: "Resolution unit", 0x0131: "Software",
+    0x0132: "Date modified", 0x013B: "Artist", 0x013E: "White point", 0x013F: "Primary chromaticities",
+    0x0211: "YCbCr coefficients", 0x0213: "YCbCr positioning", 0x0214: "Reference black/white",
+    0x8298: "Copyright", 0x4746: "Rating", 0x4749: "Rating percent", 0x9C9B: "Title (Windows)",
+    0x9C9C: "Comment (Windows)", 0x9C9D: "Author (Windows)", 0x9C9E: "Keywords (Windows)",
+    0x9C9F: "Subject (Windows)", 0xA401: "Custom rendered",
+    # Exif IFD
+    0x829A: "Exposure time", 0x829D: "F-number", 0x8822: "Exposure program", 0x8824: "Spectral sensitivity",
+    0x8827: "ISO", 0x8830: "Sensitivity type", 0x8832: "Recommended exposure index", 0x9000: "Exif version",
+    0x9003: "Date taken", 0x9004: "Date digitized", 0x9010: "Time zone", 0x9011: "Time zone (taken)",
+    0x9012: "Time zone (digitized)", 0x9101: "Components configuration", 0x9102: "Compressed bits per pixel",
+    0x9201: "Shutter speed (APEX)", 0x9202: "Aperture (APEX)", 0x9203: "Brightness (APEX)",
+    0x9204: "Exposure compensation", 0x9205: "Max aperture (APEX)", 0x9206: "Subject distance",
+    0x9207: "Metering mode", 0x9208: "Light source", 0x9209: "Flash", 0x920A: "Focal length",
+    0x9214: "Subject area", 0x927C: "Maker note", 0x9286: "User comment", 0x9290: "Subsec time",
+    0x9291: "Subsec time (taken)", 0x9292: "Subsec time (digitized)", 0xA000: "FlashPix version",
+    0xA001: "Color space", 0xA002: "Pixel width", 0xA003: "Pixel height", 0xA004: "Related sound file",
+    0xA20E: "Focal plane X resolution", 0xA20F: "Focal plane Y resolution", 0xA210: "Focal plane resolution unit",
+    0xA215: "Exposure index", 0xA217: "Sensing method", 0xA300: "File source", 0xA301: "Scene type",
+    0xA302: "CFA pattern", 0xA402: "Exposure mode", 0xA403: "White balance", 0xA404: "Digital zoom ratio",
+    0xA405: "Focal length (35 mm)", 0xA406: "Scene capture type", 0xA407: "Gain control", 0xA408: "Contrast",
+    0xA409: "Saturation", 0xA40A: "Sharpness", 0xA40C: "Subject distance range", 0xA420: "Unique image ID",
+    0xA430: "Camera owner", 0xA431: "Body serial number", 0xA432: "Lens specification", 0xA433: "Lens make",
+    0xA434: "Lens model", 0xA435: "Lens serial number", 0xA460: "Composite image",
+    # GPS IFD
+}
+GPS_NAMES = {
+    0x0000: "GPS version", 0x0001: "Latitude ref", 0x0002: "Latitude", 0x0003: "Longitude ref",
+    0x0004: "Longitude", 0x0005: "Altitude ref", 0x0006: "Altitude", 0x0007: "GPS time (UTC)",
+    0x0008: "Satellites", 0x0009: "GPS status", 0x000A: "Measure mode", 0x000B: "Precision (DOP)",
+    0x000C: "Speed unit", 0x000D: "Speed", 0x000E: "Direction of movement ref", 0x000F: "Direction of movement",
+    0x0010: "Image direction ref", 0x0011: "Image direction", 0x0012: "Map datum", 0x0017: "Destination bearing ref",
+    0x0018: "Destination bearing", 0x001B: "Processing method", 0x001C: "Area information",
+    0x001D: "GPS date", 0x001E: "Differential", 0x001F: "Horizontal error",
+}
+_EXIF_ENUMS = {
+    "Orientation": {1: "Normal", 2: "Mirrored", 3: "Upside down", 4: "Upside down, mirrored",
+                    5: "Rotated 90°, mirrored", 6: "Rotated 90° clockwise", 7: "Rotated 90°, mirrored",
+                    8: "Rotated 90° counter-clockwise"},
+    "Resolution unit": {1: "None", 2: "Inches", 3: "Centimeters"},
+    "Exposure program": {0: "Not defined", 1: "Manual", 2: "Program", 3: "Aperture priority",
+                         4: "Shutter priority", 5: "Creative", 6: "Action", 7: "Portrait", 8: "Landscape"},
+    "Metering mode": {0: "Unknown", 1: "Average", 2: "Center-weighted", 3: "Spot", 4: "Multi-spot",
+                      5: "Pattern", 6: "Partial", 255: "Other"},
+    "Light source": {0: "Unknown", 1: "Daylight", 2: "Fluorescent", 3: "Tungsten", 4: "Flash", 9: "Fine weather",
+                     10: "Cloudy", 11: "Shade", 17: "Standard light A", 21: "D65", 255: "Other"},
+    "Color space": {1: "sRGB", 2: "Adobe RGB", 0xFFFF: "Uncalibrated"},
+    "Exposure mode": {0: "Auto", 1: "Manual", 2: "Auto bracket"},
+    "White balance": {0: "Auto", 1: "Manual"},
+    "Scene capture type": {0: "Standard", 1: "Landscape", 2: "Portrait", 3: "Night"},
+    "Contrast": {0: "Normal", 1: "Soft", 2: "Hard"}, "Saturation": {0: "Normal", 1: "Low", 2: "High"},
+    "Sharpness": {0: "Normal", 1: "Soft", 2: "Hard"},
+    "Sensing method": {1: "Not defined", 2: "One-chip color", 3: "Two-chip color", 4: "Three-chip color",
+                       5: "Color sequential", 7: "Trilinear", 8: "Color sequential linear"},
+    "Compression": {1: "None", 6: "JPEG (old)", 7: "JPEG", 5: "LZW", 8: "Deflate", 32773: "PackBits"},
+    "Altitude ref": {0: "Above sea level", 1: "Below sea level"},
+}
+_TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
+
+
+def _num(v):
+    if isinstance(v, tuple) and len(v) == 2:
+        return v[0] / float(v[1]) if v[1] else 0.0
+    return float(v)
+
+
+def _fmt_num(x):
+    return ("%.4f" % x).rstrip("0").rstrip(".") if isinstance(x, float) else str(x)
+
+
+def parse_tiff_all(t):
+    """Every readable tag in a TIFF/EXIF block -> {"Image": [...], "Exif": [...], "GPS": [...], "Thumbnail": [...]}.
+    Values come back as (name, python value)."""
+    groups = {"Image": [], "Exif": [], "GPS": [], "Thumbnail": []}
+    if len(t) < 8 or t[:2] not in (b"II", b"MM"):
+        return groups
+    end = "<" if t[:2] == b"II" else ">"
+    seen = set()
+
+    def read_ifd(off, group, names):
+        if off in seen or off <= 0 or off + 2 > len(t):
+            return 0
+        seen.add(off)
+        n = struct.unpack(end + "H", t[off:off + 2])[0]
+        for k in range(min(n, 1024)):
+            e = off + 2 + 12 * k
+            if e + 12 > len(t):
+                return 0
+            tag, typ, cnt = struct.unpack(end + "HHI", t[e:e + 8])
+            valoff = t[e + 8:e + 12]
+            if tag == 0x8769 and group != "GPS":
+                read_ifd(struct.unpack(end + "I", valoff)[0], "Exif", EXIF_NAMES)
+                continue
+            if tag == 0x8825:
+                read_ifd(struct.unpack(end + "I", valoff)[0], "GPS", GPS_NAMES)
+                continue
+            if tag in (0xA005, 0x0201, 0x0202, 0x0111, 0x0117, 0x014A):  # pointers / strip offsets
+                continue
+            size = _TYPE_SIZES.get(typ, 1) * cnt
+            if size <= 4:
+                raw = valoff[:size]
+            else:
+                p = struct.unpack(end + "I", valoff)[0]
+                if p + size > len(t):
+                    continue
+                raw = t[p:p + size]
+            name = names.get(tag, "Tag 0x%04X" % tag)
+            try:
+                val = _decode(raw, typ, cnt, end, tag)
+            except (struct.error, ValueError, IndexError):
+                continue
+            if val is None or val == "":
+                continue
+            groups[group].append((name, val))
+        nxt = off + 2 + 12 * min(n, 1024)
+        if nxt + 4 <= len(t):
+            return struct.unpack(end + "I", t[nxt:nxt + 4])[0]
+        return 0
+
+    nxt = read_ifd(struct.unpack(end + "I", t[4:8])[0], "Image", EXIF_NAMES)
+    if nxt:
+        read_ifd(nxt, "Thumbnail", EXIF_NAMES)
+    return groups
+
+
+def _decode(raw, typ, cnt, end, tag):
+    if tag in (0x9C9B, 0x9C9C, 0x9C9D, 0x9C9E, 0x9C9F):  # Windows XP tags are UTF-16 in BYTE arrays
+        return raw.decode("utf-16-le", "replace").rstrip("\0").strip()
+    if tag == 0x927C:
+        return "(%s of camera-specific data)" % human_size(len(raw))
+    if tag == 0x9286:  # user comment: 8-byte charset header
+        head, body = raw[:8], raw[8:]
+        enc = "utf-16-be" if head.startswith(b"UNICODE") and end == ">" else \
+            "utf-16-le" if head.startswith(b"UNICODE") else "latin-1"
+        return body.decode(enc, "replace").rstrip("\0 ").strip()
+    if typ == 2:
+        return raw.split(b"\0")[0].decode("utf-8", "replace").strip()
+    if typ in (1, 7, 6):
+        if tag in (0x9000, 0xA000):  # versions like "0232"
+            return raw.decode("ascii", "replace")
+        if cnt > 16:
+            if typ == 7 and all(32 <= b < 127 or b in (9, 10, 13) for b in raw.rstrip(b"\0")) and raw.strip(b"\0"):
+                return raw.rstrip(b"\0").decode("ascii")
+            return "(%s of data)" % human_size(len(raw))
+        vals = list(raw)
+        return vals[0] if len(vals) == 1 else tuple(vals)
+    fmt = {3: "H", 4: "I", 8: "h", 9: "i", 11: "f", 12: "d"}.get(typ)
+    if fmt:
+        vals = struct.unpack(end + fmt * cnt, raw[:struct.calcsize(fmt) * cnt])
+        if cnt > 16:
+            return "(%d values)" % cnt
+        return vals[0] if cnt == 1 else tuple(vals)
+    if typ in (5, 10):
+        f = "II" if typ == 5 else "ii"
+        vals = [struct.unpack(end + f, raw[8 * k:8 * k + 8]) for k in range(min(cnt, 16))]
+        return vals[0] if cnt == 1 else tuple(vals)
+    return None
+
+
+def _pretty_exif(name, v):
+    """Human-friendly value for one tag."""
+    if name in _EXIF_ENUMS and isinstance(v, int):
+        return _EXIF_ENUMS[name].get(v, str(v))
+    if name == "Exposure time" and isinstance(v, tuple) and v[1]:
+        return ("1/%d s" % round(v[1] / float(v[0]))) if v[0] and v[0] < v[1] else "%s s" % _fmt_num(_num(v))
+    if name == "F-number" and isinstance(v, tuple):
+        return "f/%.1f" % _num(v)
+    if name in ("Focal length", "Focal length (35 mm)"):
+        return "%s mm" % _fmt_num(_num(v)) if isinstance(v, tuple) else "%s mm" % v
+    if name == "Exposure compensation" and isinstance(v, tuple):
+        return "%+.1f EV" % _num(v)
+    if name == "Flash" and isinstance(v, int):
+        return "Fired" if v & 1 else "Did not fire"
+    if name in ("Date taken", "Date digitized", "Date modified") and isinstance(v, str):
+        return v.replace(":", "-", 2)
+    if name == "Lens specification" and isinstance(v, tuple) and len(v) == 4:
+        a, b, c, d = (_num(x) for x in v)
+        mm = _fmt_num(a) if a == b else "%s-%s" % (_fmt_num(a), _fmt_num(b))
+        return "%s mm f/%s" % (mm, _fmt_num(c) if c == d else "%s-%s" % (_fmt_num(c), _fmt_num(d)))
+    if isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, int) for x in v) and name not in (
+            "GPS version",) and v[1] != 0 and not name.startswith("Tag 0x"):
+        return _fmt_num(_num(v))
+    if isinstance(v, tuple):
+        return ", ".join(_fmt_num(_num(x)) if isinstance(x, tuple) else str(x) for x in v)
+    return str(v)
+
+
+def _gps_rows(gps):
+    d = dict(gps)
+    rows = []
+
+    def deg(v):
+        if isinstance(v, tuple) and len(v) == 3 and all(isinstance(x, tuple) for x in v):
+            return _num(v[0]) + _num(v[1]) / 60.0 + _num(v[2]) / 3600.0
+        return None
+
+    lat, lon = deg(d.get("Latitude")), deg(d.get("Longitude"))
+    if lat is not None and lon is not None:
+        if d.get("Latitude ref") == "S":
+            lat = -lat
+        if d.get("Longitude ref") == "W":
+            lon = -lon
+        rows.append(("Coordinates", "%.6f, %.6f" % (lat, lon)))
+        rows.append(("Map", "https://www.openstreetmap.org/?mlat=%.6f&mlon=%.6f#map=16/%.6f/%.6f"
+                     % (lat, lon, lat, lon)))
+    if isinstance(d.get("Altitude"), tuple):
+        alt = _num(d["Altitude"]) * (-1 if d.get("Altitude ref") == 1 else 1)
+        rows.append(("Altitude", "%s m" % _fmt_num(round(alt, 1))))
+    if isinstance(d.get("GPS time (UTC)"), tuple) and len(d["GPS time (UTC)"]) == 3:
+        h, m, sec = (_num(x) for x in d["GPS time (UTC)"])
+        rows.append(("GPS time (UTC)", "%s %02d:%02d:%02d" % (d.get("GPS date", "").replace(":", "-"),
+                                                              h, m, sec)))
+    skip = {"Latitude", "Longitude", "Latitude ref", "Longitude ref", "Altitude", "Altitude ref",
+            "GPS time (UTC)", "GPS date"}
+    for name, v in gps:
+        if name not in skip:
+            rows.append((name, _pretty_exif(name, v)))
+    return rows
+
+
+def _xmp_rows(xml):
+    rows = []
+    for m in re.finditer(r'\s([A-Za-z][\w.-]*):([A-Za-z][\w.-]*)="([^"]*)"', xml):
+        if m.group(1) in ("xmlns", "x", "rdf") or not m.group(3).strip():
+            continue
+        rows.append(("%s:%s" % (m.group(1), m.group(2)), m.group(3)))
+    for m in re.finditer(r"<([A-Za-z][\w.-]*):([A-Za-z][\w.-]*)>([^<]+)</\1:\2>", xml):
+        if m.group(1) != "rdf" and m.group(3).strip():
+            rows.append(("%s:%s" % (m.group(1), m.group(2)), m.group(3).strip()))
+    for m in re.finditer(r"<([A-Za-z][\w.-]*):([A-Za-z][\w.-]*)>\s*<rdf:(Alt|Seq|Bag)>(.*?)</rdf:\3>", xml, re.S):
+        items = [x.strip() for x in re.findall(r"<rdf:li[^>]*>([^<]*)</rdf:li>", m.group(4)) if x.strip()]
+        if items:
+            rows.append(("%s:%s" % (m.group(1), m.group(2)), ", ".join(items)))
+    out, seen = [], set()
+    for k, v in rows:
+        if (k, v) not in seen:
+            seen.add((k, v))
+            out.append((k, v.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")))
+    return out
+
+
+def _find_blocks(path, limit=32 * 1024 * 1024):
+    """Pull raw EXIF / XMP / ICC blocks out of JPEG, PNG, WebP, TIFF and HEIF-less containers."""
+    out = {"exif": None, "xmp": None, "icc": None, "png_text": [], "notes": []}
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            data = f.read(min(size, limit))
+    except OSError:
+        return out
+    if data[:2] in (b"II", b"MM") and data[2:4] in (b"*\0", b"\0*"):
+        out["exif"] = data
+    elif data.startswith(b"\xff\xd8"):
+        i, icc = 2, []
+        while i + 4 <= len(data):
+            if data[i] != 0xFF:
+                break
+            marker = data[i + 1]
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            ln = struct.unpack(">H", data[i + 2:i + 4])[0]
+            seg = data[i + 4:i + 2 + ln]
+            if marker == 0xE1 and seg.startswith(b"Exif\0\0") and out["exif"] is None:
+                out["exif"] = seg[6:]
+            elif marker == 0xE1 and seg.startswith(b"http://ns.adobe.com/xap/1.0/\0"):
+                out["xmp"] = seg[29:].decode("utf-8", "replace")
+            elif marker == 0xE2 and seg.startswith(b"ICC_PROFILE\0"):
+                icc.append(seg[14:])
+            elif marker == 0xFE:
+                out["png_text"].append(("JPEG comment", seg.decode("utf-8", "replace").strip("\0 ")))
+            elif marker in (0xC0, 0xC1, 0xC2):
+                out["notes"].append(("JPEG type", "Progressive" if marker == 0xC2 else "Baseline"))
+            if marker == 0xDA:
+                break
+            i += 2 + ln
+        if icc:
+            out["icc"] = b"".join(icc)
+    elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        i = 8
+        while i + 8 <= len(data):
+            ln, typ = struct.unpack(">I4s", data[i:i + 8])
+            body = data[i + 8:i + 8 + ln]
+            if typ == b"eXIf":
+                out["exif"] = body
+            elif typ == b"iCCP":
+                name, _, rest = body.partition(b"\0")
+                try:
+                    out["icc"] = zlib.decompress(rest[1:])
+                except zlib.error:
+                    pass
+            elif typ in (b"tEXt", b"zTXt", b"iTXt"):
+                k, _, rest = body.partition(b"\0")
+                key = k.decode("latin-1")
+                try:
+                    if typ == b"tEXt":
+                        val = rest.decode("latin-1")
+                    elif typ == b"zTXt":
+                        val = zlib.decompress(rest[1:]).decode("latin-1")
+                    else:
+                        comp = rest[0]
+                        rest = rest[2:]
+                        _lang, _, rest = rest.partition(b"\0")
+                        _tkey, _, rest = rest.partition(b"\0")
+                        val = (zlib.decompress(rest) if comp else rest).decode("utf-8", "replace")
+                except (zlib.error, IndexError):
+                    continue
+                if key == "XML:com.adobe.xmp":
+                    out["xmp"] = val
+                else:
+                    out["png_text"].append((key, val))
+            elif typ == b"pHYs" and ln == 9:
+                x, y, unit = struct.unpack(">IIB", body)
+                if unit == 1:
+                    out["notes"].append(("Resolution", "%d × %d DPI" % (round(x * 0.0254), round(y * 0.0254))))
+            elif typ == b"acTL" and ln == 8:
+                out["notes"].append(("Animated PNG", "%d frames" % struct.unpack(">I", body[:4])[0]))
+            elif typ == b"IEND":
+                break
+            i += 12 + ln
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        i = 12
+        while i + 8 <= len(data):
+            typ, ln = struct.unpack("<4sI", data[i:i + 8])
+            body = data[i + 8:i + 8 + ln]
+            if typ == b"EXIF":
+                out["exif"] = body[6:] if body.startswith(b"Exif\0\0") else body
+            elif typ == b"XMP ":
+                out["xmp"] = body.decode("utf-8", "replace")
+            elif typ == b"ICCP":
+                out["icc"] = body
+            elif typ == b"VP8L":
+                out["notes"].append(("WebP type", "Lossless"))
+            elif typ == b"VP8 ":
+                out["notes"].append(("WebP type", "Lossy"))
+            elif typ == b"ANIM":
+                out["notes"].append(("WebP type", "Animated"))
+            i += 8 + ln + (ln & 1)
+    elif data[:6] in (b"GIF87a", b"GIF89a"):
+        out["notes"].append(("GIF version", data[3:6].decode()))
+    return out
+
+
+def _icc_description(icc):
+    """Profile name from an ICC blob ('desc' tag, v2 'desc' or v4 'mluc')."""
+    try:
+        n = struct.unpack(">I", icc[128:132])[0]
+        for k in range(min(n, 100)):
+            sig, off, ln = struct.unpack(">4sII", icc[132 + 12 * k:144 + 12 * k])
+            if sig != b"desc":
+                continue
+            tag = icc[off:off + ln]
+            if tag[:4] == b"desc":
+                cnt = struct.unpack(">I", tag[8:12])[0]
+                return tag[12:12 + cnt].split(b"\0")[0].decode("latin-1")
+            if tag[:4] == b"mluc":
+                rec_ln, rec_off = struct.unpack(">II", tag[20:28])
+                return tag[rec_off:rec_off + rec_ln].decode("utf-16-be", "replace").strip("\0")
+    except (struct.error, IndexError):
+        pass
+    return None
+
+
+def read_metadata(path, img=None):
+    """Everything we can find about an image, as [(section, [(key, value), ...]), ...]."""
+    sections = []
+    file_rows = [("Name", os.path.basename(path)), ("Folder", os.path.dirname(path))]
+    try:
+        st = os.stat(path)
+        file_rows.append(("File size", human_size(st.st_size) if st.st_size < 1024 else
+                          "%s (%s bytes)" % (human_size(st.st_size), format(st.st_size, ","))))
+        file_rows.append(("Modified", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))))
+        created = getattr(st, "st_birthtime", None) or (st.st_ctime if IS_WIN else None)
+        if created:
+            file_rows.append(("Created", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created))))
+    except OSError:
+        pass
+    sections.append(("File", file_rows))
+
+    r = QImageReader(path)
+    img_rows = []
+    if not r.canRead():
+        img_rows.append(("Problem", "This file can't be opened as an image (damaged or not really an image)"))
+    fmt = bytes(r.format()).decode("ascii", "ignore").upper()
+    if fmt:
+        img_rows.append(("Format", fmt))
+    sz = r.size()
+    if sz.isValid():
+        mp = sz.width() * sz.height() / 1e6
+        img_rows.append(("Dimensions", "%d × %d px" % (sz.width(), sz.height())
+                         + ("  (%.1f MP)" % mp if mp >= 1 else "")))
+    if img is not None:
+        img_rows.append(("Transparency", "Yes" if img.hasAlphaChannel() else "No"))
+        img_rows.append(("Bit depth", "%d bits per pixel" % img.depth()))
+        cs = img.colorSpace()
+        if cs.isValid() and cs.description():
+            img_rows.append(("Color space", cs.description()))
+    if r.supportsAnimation() and r.imageCount() > 1:
+        img_rows.append(("Frames", str(r.imageCount())))
+        if r.loopCount() != 0:
+            img_rows.append(("Loops", "Forever" if r.loopCount() < 0 else str(r.loopCount())))
+    blocks = _find_blocks(path)
+    img_rows.extend(blocks["notes"])
+    if blocks["icc"]:
+        name = _icc_description(blocks["icc"])
+        img_rows.append(("ICC profile", "%s  (%s)" % (name, human_size(len(blocks["icc"]))) if name
+                         else human_size(len(blocks["icc"]))))
+    sections.append(("Image", img_rows))
+
+    if blocks["exif"]:
+        g = parse_tiff_all(blocks["exif"])
+        cam = [(n, _pretty_exif(n, v)) for n, v in g["Image"] if not n.startswith("Tag 0x")]
+        exif = [(n, _pretty_exif(n, v)) for n, v in g["Exif"] if not n.startswith("Tag 0x")]
+        unknown = [(n, _pretty_exif(n, v)) for n, v in g["Image"] + g["Exif"] if n.startswith("Tag 0x")]
+        if cam:
+            sections.append(("Camera / image tags (EXIF)", cam))
+        if exif:
+            sections.append(("Photo settings (EXIF)", exif))
+        if g["GPS"]:
+            sections.append(("Location (GPS)", _gps_rows(g["GPS"])))
+        if unknown:
+            sections.append(("Other EXIF tags", unknown))
+        if g["Thumbnail"]:
+            sections.append(("Embedded thumbnail", [(n, _pretty_exif(n, v)) for n, v in g["Thumbnail"]]))
+
+    text = list(blocks["png_text"])
+    if not text:  # other formats Qt knows text for (e.g. GIF comments)
+        for k in r.textKeys():
+            v = r.text(k)
+            if v and k.lower() not in ("xml:com.adobe.xmp",):
+                text.append((k, v))
+    if text:
+        sections.append(("Text", text))
+    if blocks["xmp"]:
+        rows = _xmp_rows(blocks["xmp"])
+        rows.append(("Raw XMP", blocks["xmp"].strip()))
+        sections.append(("XMP", rows))
+    return sections
+
+
+def metadata_has_location(sections):
+    return any(name == "Location (GPS)" and rows for name, rows in sections)
+
+
+class MetadataDialog(Dialog):
+    """Every bit of metadata for the current image, searchable and copyable."""
+
+    def __init__(self, app):
+        super().__init__(app, "Metadata")
+        self.resize(640, 640)
+        self.sections = []
+        top = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search tags and values...")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.fill)
+        top.addWidget(self.search, 1)
+        self.body.addLayout(top)
+        self.warn = label("", "error", wrap=True)
+        self.warn.hide()
+        self.body.addWidget(self.warn)
+        self.tree = QTreeWidget()
+        self.tree.setObjectName("metatree")
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Tag", "Value"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setUniformRowHeights(False)
+        self.tree.setWordWrap(True)
+        self.tree.setAlternatingRowColors(False)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tree.header().setStretchLastSection(True)
+        self.tree.setColumnWidth(0, 210)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._menu)
+        self.tree.itemDoubleClicked.connect(self._double)
+        self.tree.setMinimumHeight(380)
+        self.body.addWidget(self.tree, 1)
+        QShortcut(QKeySequence.StandardKey.Copy, self.tree, self.copy_selected)
+        row = QHBoxLayout()
+        self.count = label("", "dim")
+        row.addWidget(self.count)
+        row.addStretch(1)
+        row.addWidget(button("Copy all", self.copy_all))
+        row.addWidget(button("Close", self.close, accent=True))
+        self.body.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        p = self.app.current_path
+        if not p:
+            self.sections = []
+        else:
+            self.sections = read_metadata(p, self.app.canvas.img)
+            err = self.app.errors.get(p)
+            if err:
+                for name, rows in self.sections:
+                    if name == "Image" and not any(k == "Problem" for k, _ in rows):
+                        rows.insert(0, ("Problem", "Couldn't be opened: %s" % err))
+        self.setWindowTitle("Metadata - %s" % os.path.basename(p) if p else "Metadata")
+        if metadata_has_location(self.sections):
+            self.warn.setText("⚠ This image has its GPS location saved in it. Anyone you send the "
+                              "original file to can see where it was taken.")
+            self.warn.show()
+        else:
+            self.warn.hide()
+        self.fill()
+
+    def fill(self, *_):
+        q = self.search.text().strip().lower()
+        self.tree.clear()
+        total = shown = 0
+        acc = QColor(self.app.theme["accent"])
+        for name, rows in self.sections:
+            if not rows:
+                continue
+            top = QTreeWidgetItem([name, ""])
+            f = top.font(0)
+            f.setBold(True)
+            top.setFont(0, f)
+            top.setForeground(0, acc)
+            top.setFirstColumnSpanned(False)
+            for k, v in rows:
+                total += 1
+                v = str(v)
+                if q and q not in k.lower() and q not in v.lower() and q not in name.lower():
+                    continue
+                shown += 1
+                display = v if len(v) <= 600 and v.count("\n") < 12 else v[:600].split("\n")[0] + "  ... (double-click to see all)"
+                it = QTreeWidgetItem([k, display])
+                it.setData(1, Qt.ItemDataRole.UserRole, v)
+                it.setToolTip(1, v[:2000])
+                top.addChild(it)
+            if top.childCount():
+                self.tree.addTopLevelItem(top)
+                top.setExpanded(True)
+        if not self.sections:
+            self.count.setText("No image open")
+        elif q:
+            self.count.setText("%d of %d tags" % (shown, total))
+        else:
+            self.count.setText("%d tags" % total)
+
+    def _value(self, it):
+        v = it.data(1, Qt.ItemDataRole.UserRole)
+        return v if v is not None else it.text(1)
+
+    def _double(self, it, col):
+        v = self._value(it)
+        if it.parent() is None:
+            return
+        if v.startswith("https://www.openstreetmap.org/"):
+            QDesktopServices.openUrl(QUrl(v))
+            return
+        d = Dialog(self.app, it.text(0))
+        box = QPlainTextEdit(v)
+        box.setObjectName("errorbox")
+        box.setReadOnly(True)
+        box.setMinimumSize(560, 360)
+        d.body.addWidget(box)
+        r = QHBoxLayout()
+        r.addStretch(1)
+        r.addWidget(button("Copy", lambda: self.app.copy_text(v)))
+        r.addWidget(button("Close", d.accept, accent=True))
+        d.body.addLayout(r)
+        d.show()
+
+    def copy_selected(self):
+        items = [it for it in self.tree.selectedItems() if it.parent() is not None]
+        if not items:
+            return
+        if len(items) == 1:
+            self.app.copy_text(self._value(items[0]))
+        else:
+            self.app.copy_text("\n".join("%s: %s" % (it.text(0), self._value(it)) for it in items))
+
+    def copy_all(self):
+        lines = []
+        for name, rows in self.sections:
+            lines.append("[%s]" % name)
+            lines.extend("%s: %s" % (k, v) for k, v in rows)
+            lines.append("")
+        self.app.copy_text("\n".join(lines).strip())
+
+    def _menu(self, pos):
+        it = self.tree.itemAt(pos)
+        m = QMenu(self)
+        if it is not None and it.parent() is not None:
+            m.addAction("Copy value", lambda: self.app.copy_text(self._value(it)))
+            m.addAction("Copy tag + value", lambda: self.app.copy_text("%s: %s" % (it.text(0), self._value(it))))
+            m.addAction("Show full value", lambda: self._double(it, 1))
+            m.addSeparator()
+        m.addAction("Copy all", self.copy_all)
+        m.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def on_theme(self):
+        super().on_theme()
+        self.fill()
+
+    def done(self, r):
+        self.app.meta_dialog = None
+        super().done(r)
+
+    def closeEvent(self, e):
+        self.app.meta_dialog = None
+        super().closeEvent(e)
 
 
 # --------------------------------------------------------------------------
@@ -2675,6 +3298,7 @@ class App:
         self.dialogs = []
         self.prefs = None
         self.theme_editor = None
+        self.meta_dialog = None
         self._showing_error = False
         self._resize_cursor = False
         self._quitting = False
@@ -2878,6 +3502,7 @@ class App:
         A(fm, "Rename...", self.rename_current, "F2")
         A(fm, "Move to trash", self.trash_current, "Del")
         A(fm, "Open containing folder", self.open_containing)
+        A(fm, "Metadata...", self.open_metadata, ["M", "Ctrl+M"])
         fm.addSeparator()
         A(fm, "Quit", self.win.close, "Ctrl+Q")
 
@@ -3009,7 +3634,8 @@ class App:
                              ("Save a copy as...", self.save_as, has), (None, None, None),
                              ("Rename...", self.rename_current, has),
                              ("Move to trash", self.trash_current, has),
-                             ("Open containing folder", self.open_containing, has), (None, None, None),
+                             ("Open containing folder", self.open_containing, has),
+                             ("Metadata...", self.open_metadata, has), (None, None, None),
                              ("Slideshow", self.toggle_slideshow, len(self.files) > 1),
                              ("Full screen", self.toggle_fullscreen, True)):
             if text is None:
@@ -3319,6 +3945,17 @@ class App:
         self.update_title()
         self.update_status()
         self.refresh_info()
+        if self.meta_dialog is not None and self.meta_dialog.isVisible():
+            self.meta_dialog.refresh()
+
+    def open_metadata(self):
+        if self.meta_dialog is None:
+            self.meta_dialog = MetadataDialog(self)
+        else:
+            self.meta_dialog.refresh()
+        self.meta_dialog.show()
+        self.meta_dialog.raise_()
+        self.meta_dialog.activateWindow()
 
     def update_title(self):
         p = self.current_path
@@ -3589,7 +4226,7 @@ class App:
             ("Fit / actual size", "0 / 1  (or double-click)"), ("Pan", "Drag with the mouse"),
             ("Rotate right / left", "R / L"), ("Flip horizontal / vertical", "H / V"),
             ("Full screen", "F, F11, Enter or middle-click"), ("Slideshow", "S  (Esc stops)"),
-            ("Filmstrip / info panel", "T / I"), ("Copy image / copy path", M + "C / " + M + "Shift+C"),
+            ("Filmstrip / info panel", "T / I"), ("All metadata", "M"), ("Copy image / copy path", M + "C / " + M + "Shift+C"),
             ("Save a copy (with rotation)", M + "S"), ("Rename / move to trash", "F2 / Delete"),
             ("Open file / folder", M + "O / " + M + "Shift+O"), ("Preferences", M + ","),
             ("Open images", "Drag them onto the window"),
