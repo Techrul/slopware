@@ -36,7 +36,7 @@ import zlib
 
 APP_NAME = "SlopView"
 APP_ID = "slopware.slopview"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -2693,7 +2693,7 @@ class App:
         for wdg in self.chrome_widgets:
             wdg.setVisible(not full)
         self.filmstrip.setVisible(s["show_filmstrip"] and not full)
-        self.info.setVisible(s["show_info"] and not full)
+        self.info_panel.setVisible(s["show_info"] and not full)
         self.status.setVisible(s["status_bar"] and not full)
         if not full:
             self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
@@ -2729,8 +2729,8 @@ class App:
         bl.setSpacing(0)
         self.canvas = Canvas(self)
         bl.addWidget(self.canvas, 1)
-        self.info = InfoPanel(self)
-        bl.addWidget(self.info)
+        self.info_panel = InfoPanel(self)
+        bl.addWidget(self.info_panel)
         lay.addWidget(body, 1)
         self.filmstrip = Filmstrip(self)
         lay.addWidget(self.filmstrip)
@@ -3283,11 +3283,11 @@ class App:
         self.on_view_changed()
 
     def refresh_info(self):
-        if not hasattr(self, "info") or not self.settings["show_info"]:
+        if not hasattr(self, "info_panel") or not self.settings["show_info"]:
             return
         p = self.current_path
         if not p:
-            self.info.show_rows([])
+            self.info_panel.show_rows([])
             return
         rows = [("Name", os.path.basename(p)), ("Folder", os.path.dirname(p))]
         img = self.canvas.img
@@ -3318,7 +3318,7 @@ class App:
                 bits.append("flipped V")
             rows.append(("View", ", ".join(bits)))
         rows.extend(format_exif(read_exif(p)))
-        self.info.show_rows(rows)
+        self.info_panel.show_rows(rows)
 
     def flash(self, msg):
         self.st_msg.setText(msg)
