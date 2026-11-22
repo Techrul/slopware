@@ -36,7 +36,7 @@ import zlib
 
 APP_NAME = "SlopView"
 APP_ID = "slopware.slopview"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -592,8 +592,25 @@ def _linux_paths():
             os.path.join(data, "applications"))
 
 
+LINUX_ICON_SIZES = (32, 48, 64, 128, 256)
+
+
+def _linux_pngs():
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return [os.path.join(data, "icons", "hicolor", "%dx%d" % (n, n), "apps", "slopview.png") for n in LINUX_ICON_SIZES]
+
+
 def _linux_refresh(apps_dir):
-    for cmd in (["update-desktop-database", apps_dir], ["kbuildsycoca6"], ["kbuildsycoca5"]):
+    data = os.path.dirname(apps_dir)
+    hicolor = os.path.join(data, "icons", "hicolor")
+    try:
+        os.utime(hicolor)  # icon caches notice changes by the folder's timestamp
+    except OSError:
+        pass
+    cmds = [["update-desktop-database", apps_dir], ["kbuildsycoca6"], ["kbuildsycoca5"]]
+    if os.path.isfile(os.path.join(hicolor, "icon-theme.cache")):  # a stale cache would hide our icon
+        cmds.insert(0, ["gtk-update-icon-cache", "-f", "-t", hicolor])
+    for cmd in cmds:
         _run_quiet(cmd)
 
 
@@ -603,6 +620,11 @@ def _linux_install(out):
     os.makedirs(os.path.dirname(icon), exist_ok=True)
     with open(icon, "w", encoding="utf-8") as f:
         f.write(ICON_SVG)
+    pngs = _linux_pngs()
+    for n, png in zip(LINUX_ICON_SIZES, pngs):
+        os.makedirs(os.path.dirname(png), exist_ok=True)
+        with open(png, "wb") as f:
+            f.write(render_icon_png(n))
     with open(desktop, "w", encoding="utf-8") as f:
         f.write(
             "[Desktop Entry]\n"
@@ -611,11 +633,11 @@ def _linux_install(out):
             "GenericName=Image Viewer\n"
             "Comment=A vibe-coded image viewer (slopware)\n"
             'Exec="%s" "%s" %%F\n'
-            "Icon=slopview\n"
+            "Icon=%s\n"
             "Terminal=false\n"
             "Categories=Graphics;Viewer;\n"
             "MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;image/svg+xml;image/x-icon;image/x-tga;\n"
-            "StartupWMClass=slopview\n" % (sys.executable, SCRIPT_PATH))
+            "StartupWMClass=slopview\n" % (sys.executable, SCRIPT_PATH, pngs[-1]))
     try:
         os.chmod(SCRIPT_PATH, os.stat(SCRIPT_PATH).st_mode | 0o111)
     except OSError:
@@ -657,6 +679,8 @@ def _linux_uninstall(out):
     desktop, icon, apps_dir = _linux_paths()
     _remove(desktop, out)
     _remove(icon, out)
+    for png in _linux_pngs():
+        _remove(png, out)
     _linux_clean_mimeapps(out)
     _linux_refresh(apps_dir)
 
