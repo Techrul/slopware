@@ -14,3 +14,4 @@ Claude :)
 | Thing a ling | What it is | Alternatives |
 | --- | --- | --- |
 |[sloppad](https://github.com/Techrul/slopware/blob/main/001-sloppad/sloppad.py)| Notepad/text editor | Whatever's built-in, [Notepad++](https://notepad-plus-plus.org/), [Notepads (Windows only)](https://www.notepadsapp.com/), [Kate](https://kate-editor.org/)|
+|[slopview](https://github.com/Techrul/slopware/blob/main/002-slopview/slopview.py)| Image viewer | Whatever's built-in, [ImageGlass](https://imageglass.org/), [qView](https://interversehq.com/qview/), [nomacs](https://nomacs.org/), [Gwenview (Linux)](https://apps.kde.org/gwenview/)|
