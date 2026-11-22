@@ -36,7 +36,7 @@ import zlib
 
 APP_NAME = "SlopView"
 APP_ID = "slopware.slopview"
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -279,6 +279,7 @@ DEFAULT_SETTINGS = {
     "checkerboard": True,
     "fit_mode": "fit",
     "wheel_action": "zoom",
+    "zoom_speed": "normal",
     "smooth_scaling": True,
     "pixelated_zoom": True,
     "animate": True,
@@ -318,6 +319,7 @@ def _compatible(default, value):
 
 FIT_VALUES = ("fit", "fit_all", "original")
 WHEEL_VALUES = ("zoom", "navigate")
+ZOOM_VALUES = ("slow", "normal", "fast")
 SORT_VALUES = ("name", "date", "size", "type")
 
 
@@ -346,7 +348,8 @@ class Settings:
         d = self.data
         for k, (lo, hi) in NUMERIC_LIMITS.items():
             d[k] = max(lo, min(hi, int(d[k])))
-        for key, allowed in (("fit_mode", FIT_VALUES), ("wheel_action", WHEEL_VALUES), ("sort_by", SORT_VALUES)):
+        for key, allowed in (("fit_mode", FIT_VALUES), ("wheel_action", WHEEL_VALUES), ("sort_by", SORT_VALUES),
+                             ("zoom_speed", ZOOM_VALUES)):
             if d[key] not in allowed:
                 d[key] = DEFAULT_SETTINGS[key]
         if not isinstance(d["custom_themes"], dict):
@@ -1754,6 +1757,8 @@ VIEW_THEME_KEYS = [
 FIT_MODES = [("fit", "Shrink big images to fit"), ("fit_all", "Fit everything (also enlarge small)"),
              ("original", "Always show at 100%")]
 WHEEL_MODES = [("zoom", "Zoom"), ("navigate", "Next / previous image")]
+ZOOM_SPEEDS = [("slow", "Slow"), ("normal", "Normal"), ("fast", "Fast")]
+ZOOM_FACTORS = {"slow": 1.12, "normal": 1.25, "fast": 1.45}  # zoom per mouse wheel notch
 SORT_MODES = [("name", "Name"), ("date", "Date modified"), ("size", "File size"), ("type", "File type")]
 
 
@@ -1963,6 +1968,8 @@ class Canvas(QWidget):
         self.app = app
         self.setObjectName("canvas")
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
+        self.grabGesture(Qt.GestureType.PinchGesture)  # touchscreens
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(200, 150)
         self.img = None
@@ -2046,7 +2053,8 @@ class Canvas(QWidget):
         self.app.on_view_changed()
 
     def zoom_by(self, steps, anchor=None):
-        self.zoom_to(self.eff_zoom() * (1.15 ** steps), anchor)
+        factor = ZOOM_FACTORS.get(self.app.settings["zoom_speed"], 1.25)
+        self.zoom_to(self.eff_zoom() * (factor ** steps), anchor)
 
     def set_fit(self):
         self.fit = True
@@ -2218,16 +2226,49 @@ class Canvas(QWidget):
         else:
             self.app.toggle_fullscreen()
 
+    def event(self, e):
+        t = e.type()
+        if t == QEvent.Type.NativeGesture:  # trackpad pinch (KDE/GNOME Wayland, X11, macOS)
+            g = e.gestureType()
+            if g == Qt.NativeGestureType.ZoomNativeGesture and self.pix is not None:
+                self.zoom_to(self.eff_zoom() * (1.0 + e.value()), e.position())
+                return True
+            if g == Qt.NativeGestureType.SmartZoomNativeGesture and self.pix is not None:
+                if self.fit:
+                    self.zoom_to(1.0, e.position())
+                else:
+                    self.set_fit()
+                return True
+            if g in (Qt.NativeGestureType.BeginNativeGesture, Qt.NativeGestureType.EndNativeGesture):
+                return True
+        elif t == QEvent.Type.Gesture:  # touchscreen pinch
+            pinch = e.gesture(Qt.GestureType.PinchGesture)
+            if pinch is not None and self.pix is not None:
+                anchor = self.mapFromGlobal(pinch.centerPoint().toPoint())
+                self.zoom_to(self.eff_zoom() * pinch.scaleFactor(), QPointF(anchor))
+                e.accept()
+                return True
+        return super().event(e)
+
     def wheelEvent(self, e):
-        dy = e.angleDelta().y()
+        # mouse wheels report 120 per notch; some touchpads only report pixels, so convert those
+        dy = e.angleDelta().y() or e.angleDelta().x()
         if not dy:
+            px = e.pixelDelta().y() or e.pixelDelta().x()
+            dy = px * 2
+        if not dy:
+            e.accept()
             return
-        steps = dy / 120.0
         ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
         if ctrl or self.app.settings["wheel_action"] == "zoom":
-            self.zoom_by(steps, e.position())
+            self.zoom_by(dy / 120.0, e.position())
         else:
-            self.app.go(-1 if dy > 0 else 1)
+            # add up small touchpad / smooth-wheel movements so one swipe = one image
+            self._wheel_acc = getattr(self, "_wheel_acc", 0) + dy
+            while abs(self._wheel_acc) >= 120:
+                step = 1 if self._wheel_acc > 0 else -1
+                self._wheel_acc -= 120 * step
+                self.app.go(-step)
         e.accept()
 
     def contextMenuEvent(self, e):
@@ -2487,6 +2528,7 @@ class PrefsDialog(Dialog):
         self.section(left, "VIEWING")
         self.choice(left, "Opening an image", "fit_mode", FIT_MODES, 230)
         self.choice(left, "Mouse wheel", "wheel_action", WHEEL_MODES, 230)
+        self.choice(left, "Zoom speed", "zoom_speed", ZOOM_SPEEDS, 230)
         self.toggle(left, "Smooth scaling", "smooth_scaling")
         self.toggle(left, "Crisp pixels when zoomed in", "pixelated_zoom")
         self.toggle(left, "Play animated GIF / WebP", "animate")
