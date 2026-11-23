@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopPad"
 APP_ID = "slopware.sloppad"
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -1943,10 +1943,13 @@ class Editor(QPlainTextEdit):
             return
         t, s = self.app.theme, self.app.settings
         focused = self.hasFocus()
+        # while Settings / the theme editor is open, show the real cursor as a live preview
+        previewing = not focused and self.window().isActiveWindow() is False and any(
+            d is not None and d.isVisible() for d in (self.app.prefs, self.app.theme_editor))
         rect = self._cursor_paint_rect()
         p = QPainter(self.viewport())
         color = QColor(t["cursor"])
-        if focused and self._blink_on:
+        if (focused and self._blink_on) or previewing:
             if s["block_cursor"]:
                 p.fillRect(rect, color)
                 ch = self._char_under_cursor()
@@ -3352,6 +3355,7 @@ class PrefsDialog(Dialog):
     def done(self, r):
         self.app.prefs = None
         super().done(r)
+        QTimer.singleShot(0, self.app.repaint_cursor)
 
 
 class ThemeEditor(Dialog):
@@ -4249,6 +4253,11 @@ class App:
             return
         self.prefs = PrefsDialog(self)
         self.prefs.show()
+        QTimer.singleShot(0, self.repaint_cursor)
+
+    def repaint_cursor(self):
+        if self.current is not None:
+            self.current.editor.viewport().update()
 
     def open_theme_editor(self):
         if self.theme_editor is not None:
