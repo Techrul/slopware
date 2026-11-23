@@ -20,6 +20,7 @@ Settings live in:
 import collections
 import copy
 import json
+import math
 import os
 import platform
 import re
@@ -36,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopView"
 APP_ID = "slopware.slopview"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -293,6 +294,9 @@ DEFAULT_SETTINGS = {
     "slideshow_seconds": 4,
     "slideshow_shuffle": False,
     "confirm_delete": True,
+    "draw_tool": "ellipse",
+    "draw_color": "#ff3b30",
+    "draw_size": 4,
     "reopen_last": True,
     "last_path": "",
     "ui_font_size": 10,
@@ -303,7 +307,7 @@ DEFAULT_SETTINGS = {
 }
 
 NUMERIC_LIMITS = {
-    "canvas_opacity": (0, 100), "thumb_size": (40, 200), "slideshow_seconds": (1, 120), "ui_font_size": (7, 24),
+    "canvas_opacity": (0, 100), "thumb_size": (40, 200), "slideshow_seconds": (1, 120), "ui_font_size": (7, 24), "draw_size": (1, 40),
 }
 
 
@@ -320,6 +324,7 @@ def _compatible(default, value):
 FIT_VALUES = ("fit", "fit_all", "original")
 WHEEL_VALUES = ("zoom", "navigate")
 ZOOM_VALUES = ("slow", "normal", "fast")
+DRAW_TOOL_VALUES = ("pen", "highlighter", "line", "arrow", "rect", "ellipse", "text", "counter", "pixelate")
 SORT_VALUES = ("name", "date", "size", "type")
 
 
@@ -349,9 +354,10 @@ class Settings:
         for k, (lo, hi) in NUMERIC_LIMITS.items():
             d[k] = max(lo, min(hi, int(d[k])))
         for key, allowed in (("fit_mode", FIT_VALUES), ("wheel_action", WHEEL_VALUES), ("sort_by", SORT_VALUES),
-                             ("zoom_speed", ZOOM_VALUES)):
+                             ("zoom_speed", ZOOM_VALUES), ("draw_tool", DRAW_TOOL_VALUES)):
             if d[key] not in allowed:
                 d[key] = DEFAULT_SETTINGS[key]
+        d["draw_color"] = norm_hex(d["draw_color"]) or DEFAULT_SETTINGS["draw_color"]
         if not isinstance(d["custom_themes"], dict):
             d["custom_themes"] = {}
         d["recent"] = [p for p in d["recent"] if isinstance(p, str)][:15]
@@ -1064,8 +1070,9 @@ if __name__ == "__main__":
 try:
     from PySide6.QtCore import (QEvent, QFileSystemWatcher, QObject, QPoint, QPointF, QRectF, QSize, Qt,
                                 QTimer, QUrl, Signal)
-    from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
-                               QImage, QImageReader, QImageWriter, QIntValidator, QKeySequence, QMovie, QPainter,
+    from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QConicalGradient, QDesktopServices, QFont, QFontDatabase, QFontMetricsF,
+                               QIcon,
+                               QImage, QImageReader, QImageWriter, QIntValidator, QKeySequence, QMovie, QPainter, QPainterPath,
                                QPen, QPixmap, QShortcut, QTransform)
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication, QColorDialog, QDialog, QFileDialog, QFrame,
@@ -1981,6 +1988,8 @@ class Canvas(QWidget):
         self.zoom = 1.0
         self.offset = QPointF(0, 0)
         self._drag = None
+        self.drawing = None
+        self._draw_start = None
         self._cache = None
         self._cache_key = None
         self._checker = None
@@ -2082,13 +2091,32 @@ class Canvas(QWidget):
         """The image as currently shown (rotation + flips), for copying / saving."""
         if self.img is None:
             return None
-        return self.img.transformed(self._orient_transform(), Qt.TransformationMode.SmoothTransformation)
+        img = self.img if self.app.markup.empty() else self.app.markup.render(self.img)
+        if not (self.rotation or self.flip_h or self.flip_v):
+            return img
+        return img.transformed(self._orient_transform(), Qt.TransformationMode.SmoothTransformation)
 
     def _orient_transform(self):
         t = QTransform()
         t.scale(-1 if self.flip_h else 1, -1 if self.flip_v else 1)
         t.rotate(90 * self.rotation)
         return t
+
+    def image_transform(self):
+        """Maps image pixels -> widget coordinates (zoom, pan, rotation, flips)."""
+        z = self.eff_zoom()
+        w, h = self.pix.width(), self.pix.height()
+        t = QTransform()
+        t.translate(self.width() / 2.0 + self.offset.x(), self.height() / 2.0 + self.offset.y())
+        t.scale(-1 if self.flip_h else 1, -1 if self.flip_v else 1)
+        t.rotate(90 * self.rotation)
+        t.translate(-w * z / 2.0, -h * z / 2.0)
+        t.scale(z, z)
+        return t
+
+    def to_image(self, pos):
+        inv, _ok = self.image_transform().inverted()
+        return inv.map(QPointF(pos))
 
     def _clamp(self):
         w, h = self.oriented_size()
@@ -2176,6 +2204,10 @@ class Canvas(QWidget):
             p.drawPixmap(QRectF(-pw / 2.0, -ph / 2.0, pw, ph), self.pix, QRectF(self.pix.rect()))
             if self._cache_wanted():
                 self.cache_timer.start(70)
+        shapes = self.app.markup.shapes
+        if shapes or self.drawing:
+            p.setTransform(self.image_transform())
+            paint_shapes(p, shapes + ([self.drawing] if self.drawing else []), self.img)
         p.end()
 
     def resizeEvent(self, e):
@@ -2193,6 +2225,13 @@ class Canvas(QWidget):
         if b == Qt.MouseButton.ForwardButton:
             self.app.go(1)
             return
+        if self.app.draw_mode and self.pix is not None:
+            if b == Qt.MouseButton.LeftButton:
+                self.start_shape(e.position(), e.modifiers())
+            elif b == Qt.MouseButton.MiddleButton:  # pan while drawing
+                self._drag = (e.position(), QPointF(self.offset))
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if b == Qt.MouseButton.LeftButton and self.can_pan():
             self._drag = (e.position(), QPointF(self.offset))
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -2202,21 +2241,80 @@ class Canvas(QWidget):
 
     def mouseMoveEvent(self, e):
         self._show_cursor()
+        if self.drawing is not None:
+            self.move_shape(e.position(), e.modifiers())
+            return
         if self._drag is not None:
             start, off = self._drag
             self.offset = off + (e.position() - start)
             self._clamp()
             self.update()
         else:
-            self.setCursor(Qt.CursorShape.OpenHandCursor if self.can_pan() else Qt.CursorShape.ArrowCursor)
+            self.setCursor(self.idle_cursor())
+
+    def idle_cursor(self):
+        if self.app.draw_mode and self.pix is not None:
+            return Qt.CursorShape.CrossCursor
+        return Qt.CursorShape.OpenHandCursor if self.can_pan() else Qt.CursorShape.ArrowCursor
 
     def mouseReleaseEvent(self, e):
+        if self.drawing is not None and e.button() == Qt.MouseButton.LeftButton:
+            self.move_shape(e.position(), e.modifiers())
+            self.finish_shape(e.position())
+            return
         if self._drag is not None:
             self._drag = None
-            self.setCursor(Qt.CursorShape.OpenHandCursor if self.can_pan() else Qt.CursorShape.ArrowCursor)
+            self.setCursor(self.idle_cursor())
         super().mouseReleaseEvent(e)
 
+    # ---- drawing
+    def start_shape(self, pos, mods):
+        s = self.app.settings
+        z = self.eff_zoom() or 1.0
+        ip = self.to_image(pos)
+        tool, color, size = s["draw_tool"], s["draw_color"], s["draw_size"]
+        if tool == "text":
+            text = TextPrompt.ask_text(self.app)
+            if text:
+                self.app.markup_add({"kind": "text", "color": color, "width": size / z, "pts": [ip],
+                                     "text": text, "size": (11 + size * 2.2) / z})
+            return
+        if tool == "counter":
+            n = 1 + sum(1 for x in self.app.markup.shapes if x["kind"] == "counter")
+            self.app.markup_add({"kind": "counter", "color": color, "width": size / z, "pts": [ip], "n": n,
+                                 "size": (9 + size * 1.3) / z})
+            return
+        self.drawing = {"kind": tool, "color": color, "width": size / z,
+                        "pts": [ip] if tool in ("pen", "highlighter") else [ip, ip]}
+        self._draw_start = QPointF(pos)
+        self.update()
+
+    def move_shape(self, pos, mods):
+        d = self.drawing
+        if d is None:
+            return
+        ip = self.to_image(pos)
+        if d["kind"] in ("pen", "highlighter"):
+            last = d["pts"][-1]
+            if (ip - last).manhattanLength() * self.eff_zoom() >= 1.5:
+                d["pts"].append(ip)
+        else:
+            if mods & Qt.KeyboardModifier.ShiftModifier:
+                ip = snap_45(d["pts"][0], ip) if d["kind"] in ("line", "arrow") else square_from(d["pts"][0], ip)
+            d["pts"][1] = ip
+        self.update()
+
+    def finish_shape(self, pos):
+        d, self.drawing = self.drawing, None
+        start, self._draw_start = self._draw_start, None
+        if d["kind"] not in ("pen", "highlighter") and start is not None and (pos - start).manhattanLength() < 4:
+            self.update()  # just a click - nothing to draw
+            return
+        self.app.markup_add(d)
+
     def mouseDoubleClickEvent(self, e):
+        if self.app.draw_mode:
+            return
         if e.button() != Qt.MouseButton.LeftButton or self.pix is None:
             return
         if self.fit and abs(self.fit_zoom() - 1.0) > 0.001:
@@ -2282,7 +2380,7 @@ class Canvas(QWidget):
             self.hide_cursor_timer.start(2000)
 
     def _hide_cursor(self):
-        if self.app.win.isFullScreen() and self._drag is None:
+        if self.app.win.isFullScreen() and self._drag is None and not self.app.draw_mode:
             self.setCursor(Qt.CursorShape.BlankCursor)
 
 
@@ -2643,6 +2741,7 @@ class PrefsDialog(Dialog):
 
 
 VIEWER_STYLESHEET = """
+    #drawbar { background: %(ui_bg)s; }
     QTreeWidget#metatree { background: %(input_bg)s; color: %(fg)s; border: 1px solid %(border)s;
         border-radius: 6px; padding: 4px; outline: none; }
     QTreeWidget#metatree::item { padding: 3px 2px; }
@@ -3273,6 +3372,547 @@ class MetadataDialog(Dialog):
 
 
 # --------------------------------------------------------------------------
+# Drawing on images (markup)
+# --------------------------------------------------------------------------
+
+DRAW_TOOLS = [
+    ("pen", "Pen"), ("highlighter", "Highlighter"), ("line", "Line"), ("arrow", "Arrow"),
+    ("rect", "Box (hold Shift for a square)"), ("ellipse", "Circle (hold Shift for a perfect circle)"),
+    ("text", "Text"), ("counter", "Numbered marker"), ("pixelate", "Blur out (hide private stuff)"),
+]
+DRAW_TOOL_VALUES = tuple(k for k, _ in DRAW_TOOLS)
+DRAW_COLORS = ["#ff3b30", "#ff9f0a", "#ffd60a", "#30d158", "#0a84ff", "#bf5af2", "#ffffff", "#000000"]
+DRAW_SIZES = [2, 4, 7, 12]  # screen pixels
+
+
+class Markup:
+    """The drawings on the current image, in image pixel coordinates, with undo / redo."""
+
+    def __init__(self):
+        self.history = [[]]
+        self.pos = 0
+        self.dirty = False
+
+    @property
+    def shapes(self):
+        return self.history[self.pos]
+
+    def empty(self):
+        return not self.shapes
+
+    def _push(self, shapes):
+        self.history = self.history[:self.pos + 1] + [shapes]
+        if len(self.history) > 300:
+            self.history = self.history[-300:]
+        self.pos = len(self.history) - 1
+        self.dirty = True
+
+    def add(self, shape):
+        self._push(self.shapes + [shape])
+
+    def clear(self):
+        if self.shapes:
+            self._push([])
+
+    def can_undo(self):
+        return self.pos > 0
+
+    def can_redo(self):
+        return self.pos < len(self.history) - 1
+
+    def undo(self):
+        if self.can_undo():
+            self.pos -= 1
+            self.dirty = True
+            return True
+        return False
+
+    def redo(self):
+        if self.can_redo():
+            self.pos += 1
+            self.dirty = True
+            return True
+        return False
+
+    def reset(self):
+        self.__init__()
+
+    def render(self, img):
+        """A copy of img with the drawings burned in."""
+        fmt = QImage.Format.Format_ARGB32_Premultiplied if img.hasAlphaChannel() else QImage.Format.Format_RGB32
+        out = img.convertToFormat(fmt)
+        p = QPainter(out)
+        paint_shapes(p, self.shapes, img)
+        p.end()
+        return out
+
+
+def _smooth_path(pts):
+    path = QPainterPath(pts[0])
+    if len(pts) == 1:
+        path.lineTo(pts[0] + QPointF(0.01, 0.01))
+        return path
+    if len(pts) == 2:
+        path.lineTo(pts[1])
+        return path
+    for i in range(1, len(pts) - 1):
+        mid = (pts[i] + pts[i + 1]) / 2.0
+        path.quadTo(pts[i], mid)
+    path.lineTo(pts[-1])
+    return path
+
+
+def _pixelated(img, rect):
+    r = rect.toAlignedRect().intersected(img.rect())
+    if r.width() < 2 or r.height() < 2:
+        return None, r
+    block = max(6, round(max(img.width(), img.height()) / 90.0))
+    small = img.copy(r).scaled(max(1, r.width() // block), max(1, r.height() // block),
+                               Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    return small.scaled(r.width(), r.height(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                        Qt.TransformationMode.FastTransformation), r
+
+
+def _text_font(size):
+    f = QFont(QApplication.font())
+    f.setBold(True)
+    f.setPixelSize(max(4, int(round(size))))
+    return f
+
+
+def paint_shapes(p, shapes, img):
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    for sh in shapes:
+        paint_shape(p, sh, img)
+    p.restore()
+
+
+def paint_shape(p, sh, img):
+    kind = sh["kind"]
+    color = QColor(sh["color"])
+    w = sh["width"]
+    pts = sh["pts"]
+    if not pts:
+        return
+    a, b = pts[0], pts[-1]
+    pen = QPen(color, w)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    if kind in ("pen", "highlighter"):
+        if kind == "highlighter":
+            color.setAlpha(95)
+            pen = QPen(color, w * 3.5)
+            pen.setCapStyle(Qt.PenCapStyle.SquareCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPath(_smooth_path(pts))
+    elif kind == "line":
+        p.setPen(pen)
+        p.drawLine(a, b)
+    elif kind == "arrow":
+        d = b - a
+        length = math.hypot(d.x(), d.y())
+        if length < 0.5:
+            return
+        ux, uy = d.x() / length, d.y() / length
+        head = min(max(w * 4.5, w + 6), length * 0.6)
+        base = b - QPointF(ux, uy) * head
+        p.setPen(pen)
+        p.drawLine(a, base + QPointF(ux, uy) * (w * 0.5))
+        px, py = -uy, ux
+        half = head * 0.55
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawPolygon([b, base + QPointF(px, py) * half, base - QPointF(px, py) * half])
+    elif kind in ("rect", "ellipse"):
+        r = QRectF(a, b).normalized()
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin if kind == "rect" else Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        if kind == "rect":
+            p.drawRect(r)
+        else:
+            p.drawEllipse(r)
+    elif kind == "pixelate":
+        r = QRectF(a, b).normalized()
+        if img is None:
+            return
+        key = (img.cacheKey(), r.x(), r.y(), r.width(), r.height())
+        cached = sh.get("_cache")
+        if not cached or cached[0] != key:
+            pix, ir = _pixelated(img, r)
+            sh["_cache"] = cached = (key, pix, ir)
+        if cached[1] is not None:
+            p.drawImage(cached[2].topLeft(), cached[1])
+    elif kind == "text":
+        text = sh.get("text", "")
+        if not text:
+            return
+        f = _text_font(sh["size"])
+        fm = QFontMetricsF(f)
+        path = QPainterPath()
+        y = a.y() + fm.ascent()
+        for line in text.split("\n"):
+            path.addText(QPointF(a.x(), y), f, line)
+            y += fm.lineSpacing()
+        outline = QColor(contrast_text(sh["color"]))
+        outline.setAlpha(200)
+        op = QPen(outline, max(1.0, sh["size"] / 7.0))
+        op.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(op)
+        p.drawPath(path)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawPath(path)
+    elif kind == "counter":
+        r = sh["size"]
+        p.setPen(QPen(QColor(contrast_text(sh["color"])), max(1.0, r / 9.0)))
+        p.setBrush(color)
+        p.drawEllipse(a, r, r)
+        f = _text_font(r * 1.15)
+        p.setFont(f)
+        p.setPen(QColor(contrast_text(sh["color"])))
+        p.drawText(QRectF(a.x() - r, a.y() - r, 2 * r, 2 * r), int(Qt.AlignmentFlag.AlignCenter), str(sh["n"]))
+
+
+def snap_45(a, b):
+    d = b - a
+    ang = math.atan2(d.y(), d.x())
+    step = math.pi / 4
+    ang = round(ang / step) * step
+    length = math.hypot(d.x(), d.y())
+    return a + QPointF(math.cos(ang) * length, math.sin(ang) * length)
+
+
+def square_from(a, b):
+    d = b - a
+    s = max(abs(d.x()), abs(d.y()))
+    return a + QPointF(s if d.x() >= 0 else -s, s if d.y() >= 0 else -s)
+
+
+class DrawIcon(QAbstractButton):
+    """Little toolbar button with a hand-drawn icon (looks the same on every OS)."""
+
+    def __init__(self, bar, kind, tip, slot, checkable=False, size=32):
+        super().__init__()
+        self.bar, self.kind, self.hover = bar, kind, False
+        self.setCheckable(checkable)
+        self.setToolTip(tip)
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clicked.connect(lambda *_: slot())
+
+    def enterEvent(self, e):
+        self.hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _e):
+        t = self.bar.app.theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        if self.isChecked():
+            p.setPen(QPen(QColor(t["accent"]), 1.5))
+            p.setBrush(QColor(t["tab_active_bg"]))
+            p.drawRoundedRect(r, 6, 6)
+        elif self.hover or self.isDown():
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(t["ui_hover"]))
+            p.drawRoundedRect(r, 6, 6)
+        fg = QColor(t["accent"] if self.isChecked() else t["ui_fg"])
+        if not self.isEnabled():
+            fg = QColor(t["ui_dim"])
+            fg.setAlpha(110)
+        self.draw_glyph(p, fg, self.width() / 2.0, self.height() / 2.0)
+
+    def draw_glyph(self, p, fg, cx, cy):
+        k = self.kind
+        pen = QPen(fg, 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        P = QPointF
+        if k == "pen":
+            path = QPainterPath(P(cx - 8, cy + 5))
+            path.cubicTo(P(cx - 4, cy - 9), P(cx + 1, cy + 9), P(cx + 4, cy - 2))
+            path.quadTo(P(cx + 6, cy - 7), P(cx + 8, cy - 5))
+            p.drawPath(path)
+        elif k == "highlighter":
+            c = QColor(fg)
+            c.setAlpha(120)
+            hp = QPen(c, 6)
+            hp.setCapStyle(Qt.PenCapStyle.SquareCap)
+            p.setPen(hp)
+            p.drawLine(P(cx - 6, cy + 2), P(cx + 6, cy + 2))
+            p.setPen(pen)
+            p.drawLine(P(cx - 8, cy + 7), P(cx + 8, cy + 7))
+            p.drawLine(P(cx - 3, cy - 7), P(cx + 3, cy - 7))
+        elif k == "line":
+            p.drawLine(P(cx - 7, cy + 7), P(cx + 7, cy - 7))
+        elif k == "arrow":
+            p.drawLine(P(cx - 7, cy + 7), P(cx + 6, cy - 6))
+            p.setBrush(fg)
+            p.drawPolygon([P(cx + 8, cy - 8), P(cx + 1, cy - 6), P(cx + 6, cy - 1)])
+        elif k == "rect":
+            p.drawRect(QRectF(cx - 8, cy - 6, 16, 12))
+        elif k == "ellipse":
+            p.drawEllipse(QRectF(cx - 8, cy - 6.5, 16, 13))
+        elif k == "text":
+            p.drawLine(P(cx - 6, cy - 7), P(cx + 6, cy - 7))
+            p.drawLine(P(cx, cy - 7), P(cx, cy + 7))
+            p.drawLine(P(cx - 2.5, cy + 7), P(cx + 2.5, cy + 7))
+        elif k == "counter":
+            p.drawEllipse(P(cx, cy), 8, 8)
+            p.drawLine(P(cx - 2, cy - 3), P(cx + 0.5, cy - 5))
+            p.drawLine(P(cx + 0.5, cy - 5), P(cx + 0.5, cy + 4.5))
+        elif k == "pixelate":
+            p.setPen(Qt.PenStyle.NoPen)
+            for i in range(3):
+                for j in range(3):
+                    c = QColor(fg)
+                    c.setAlpha(230 if (i + j) % 2 == 0 else 90)
+                    p.setBrush(c)
+                    p.drawRect(QRectF(cx - 7.5 + 5 * i, cy - 7.5 + 5 * j, 5, 5))
+        elif k in ("undo", "redo"):
+            s = -1 if k == "redo" else 1
+            path = QPainterPath(P(cx + 6 * s, cy + 6))
+            path.cubicTo(P(cx + 8 * s, cy - 4), P(cx - 2 * s, cy - 6), P(cx - 7 * s, cy - 2))
+            p.drawPath(path)
+            p.drawLine(P(cx - 7 * s, cy - 2), P(cx - 7 * s, cy - 8))
+            p.drawLine(P(cx - 7 * s, cy - 2), P(cx - 1 * s, cy - 2))
+        elif k == "clear":
+            p.drawLine(P(cx - 7, cy - 5), P(cx + 7, cy - 5))
+            p.drawLine(P(cx - 2.5, cy - 8), P(cx + 2.5, cy - 8))
+            p.drawLine(P(cx - 2.5, cy - 8), P(cx - 2.5, cy - 5))
+            p.drawLine(P(cx + 2.5, cy - 8), P(cx + 2.5, cy - 5))
+            path = QPainterPath(P(cx - 5.5, cy - 5))
+            path.lineTo(P(cx - 4.5, cy + 8))
+            path.lineTo(P(cx + 4.5, cy + 8))
+            path.lineTo(P(cx + 5.5, cy - 5))
+            p.drawPath(path)
+            p.drawLine(P(cx - 1.5, cy - 1), P(cx - 1.2, cy + 5))
+            p.drawLine(P(cx + 1.5, cy - 1), P(cx + 1.2, cy + 5))
+        elif k == "copy":
+            p.drawRoundedRect(QRectF(cx - 7, cy - 4, 10, 12), 2, 2)
+            path = QPainterPath(P(cx - 3, cy - 6))
+            path.lineTo(P(cx - 3, cy - 8))
+            path.lineTo(P(cx + 7, cy - 8))
+            path.lineTo(P(cx + 7, cy + 4))
+            path.lineTo(P(cx + 5, cy + 4))
+            p.drawPath(path)
+        elif k == "save":
+            p.drawLine(P(cx, cy - 8), P(cx, cy + 3))
+            p.drawLine(P(cx - 4.5, cy - 1.5), P(cx, cy + 3))
+            p.drawLine(P(cx + 4.5, cy - 1.5), P(cx, cy + 3))
+            path = QPainterPath(P(cx - 8, cy + 2))
+            path.lineTo(P(cx - 8, cy + 8))
+            path.lineTo(P(cx + 8, cy + 8))
+            path.lineTo(P(cx + 8, cy + 2))
+            p.drawPath(path)
+        elif k == "done":
+            p.setPen(QPen(fg, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawPolyline([P(cx - 7, cy), P(cx - 2, cy + 5), P(cx + 7, cy - 5)])
+
+
+class Swatch(QAbstractButton):
+    def __init__(self, bar, color, slot, tip=None, size=24):
+        super().__init__()
+        self.bar, self.color = bar, color  # color None = "pick a custom color"
+        self.setFixedSize(size, size)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setToolTip(tip or color)
+        self.clicked.connect(lambda *_: slot(self))
+
+    def paintEvent(self, _e):
+        t = self.bar.app.theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QPointF(self.width() / 2.0, self.height() / 2.0)
+        rad = self.width() / 2.0 - 4
+        if self.isChecked():
+            p.setPen(QPen(QColor(t["accent"]), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(c, rad + 2.5, rad + 2.5)
+        if self.color is None:
+            g = QConicalGradient(c, 90)
+            for i, col in enumerate(("#ff3b30", "#ffd60a", "#30d158", "#0a84ff", "#bf5af2", "#ff3b30")):
+                g.setColorAt(i / 5.0, QColor(col))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(g))
+            p.drawEllipse(c, rad, rad)
+            p.setBrush(QColor(t["ui_bg"]))
+            p.drawEllipse(c, rad * 0.55, rad * 0.55)
+            p.setPen(QPen(QColor(t["ui_fg"]), 1.4))
+            p.drawLine(QPointF(c.x() - 2.5, c.y()), QPointF(c.x() + 2.5, c.y()))
+            p.drawLine(QPointF(c.x(), c.y() - 2.5), QPointF(c.x(), c.y() + 2.5))
+        else:
+            p.setPen(QPen(QColor(blend(t["ui_bg"], t["ui_fg"], 0.35)), 1))
+            p.setBrush(QColor(self.color))
+            p.drawEllipse(c, rad, rad)
+
+
+class SizeDot(QAbstractButton):
+    def __init__(self, bar, size_px, slot):
+        super().__init__()
+        self.bar, self.size_px = bar, size_px
+        self.setFixedSize(26, 30)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setToolTip("Thickness %d" % (DRAW_SIZES.index(size_px) + 1))
+        self.clicked.connect(lambda *_: slot(self))
+
+    def paintEvent(self, _e):
+        t = self.bar.app.theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 3, -1, -3)
+        if self.isChecked():
+            p.setPen(QPen(QColor(t["accent"]), 1.5))
+            p.setBrush(QColor(t["tab_active_bg"]))
+            p.drawRoundedRect(r, 6, 6)
+        d = {2: 3, 4: 5.5, 7: 8.5, 12: 12}.get(self.size_px, 6)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(self.bar.app.settings["draw_color"]))
+        p.drawEllipse(QPointF(self.width() / 2.0, self.height() / 2.0), d / 2.0, d / 2.0)
+
+
+class DrawBar(QWidget):
+    """The drawing toolbar shown above the image in drawing mode."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.setObjectName("drawbar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        h = QHBoxLayout()
+        h.setContentsMargins(8, 3, 8, 3)
+        h.setSpacing(1)
+        outer.addLayout(h)
+        outer.addWidget(sep())
+        self.tools = {}
+        for key, tip in DRAW_TOOLS:
+            b = DrawIcon(self, key, tip, lambda k=key: self.pick_tool(k), checkable=True)
+            self.tools[key] = b
+            h.addWidget(b)
+        h.addSpacing(10)
+        self.swatches = []
+        for c in DRAW_COLORS:
+            s = Swatch(self, c, self.pick_swatch)
+            self.swatches.append(s)
+            h.addWidget(s)
+        self.custom = Swatch(self, None, self.pick_custom, tip="Pick any color...")
+        h.addWidget(self.custom)
+        h.addSpacing(10)
+        self.sizes = []
+        for n in DRAW_SIZES:
+            d = SizeDot(self, n, self.pick_size)
+            self.sizes.append(d)
+            h.addWidget(d)
+        h.addSpacing(10)
+        A = self.app
+        self.undo_b = DrawIcon(self, "undo", "Undo (Ctrl+Z)", A.markup_undo)
+        self.redo_b = DrawIcon(self, "redo", "Redo (Ctrl+Shift+Z)", A.markup_redo)
+        self.clear_b = DrawIcon(self, "clear", "Erase all drawings", A.markup_clear)
+        for b in (self.undo_b, self.redo_b, self.clear_b):
+            h.addWidget(b)
+        h.addStretch(1)
+        self.copy_b = DrawIcon(self, "copy", "Copy image with drawings (Ctrl+C)", A.copy_image)
+        self.save_b = DrawIcon(self, "save", "Save...", self.save_menu)
+        self.done_b = DrawIcon(self, "done", "Done drawing (D or Esc)", A.toggle_draw)
+        for b in (self.copy_b, self.save_b, self.done_b):
+            h.addWidget(b)
+        self.sync()
+
+    def pick_tool(self, key):
+        self.app.set_setting("draw_tool", key)
+        self.sync()
+
+    def pick_swatch(self, sw):
+        self.app.set_setting("draw_color", sw.color)
+        self.sync()
+
+    def pick_custom(self, _sw):
+        start = QColor(self.app.settings["draw_color"])
+        c = QColorDialog.getColor(start, self.app.win, "Drawing color")
+        if c.isValid():
+            self.app.set_setting("draw_color", c.name())
+        self.sync()
+
+    def pick_size(self, dot):
+        self.app.set_setting("draw_size", dot.size_px)
+        self.sync()
+
+    def save_menu(self):
+        m = QMenu(self)
+        m.addAction("Save a copy...", self.app.save_as)
+        a = m.addAction("Save over the original", self.app.save_over_original)
+        a.setEnabled(self.app.can_overwrite())
+        m.exec(self.save_b.mapToGlobal(QPoint(0, self.save_b.height())))
+
+    def sync(self):
+        s = self.app.settings
+        for key, b in self.tools.items():
+            b.setChecked(key == s["draw_tool"])
+        col = s["draw_color"].lower()
+        known = False
+        for sw in self.swatches:
+            sw.setChecked(sw.color == col)
+            known = known or sw.color == col
+        self.custom.setChecked(not known)
+        for d in self.sizes:
+            d.setChecked(d.size_px == min(DRAW_SIZES, key=lambda n: abs(n - s["draw_size"])))
+            d.update()
+        self.sync_history()
+
+    def sync_history(self):
+        m = self.app.markup
+        self.undo_b.setEnabled(m.can_undo())
+        self.redo_b.setEnabled(m.can_redo())
+        self.clear_b.setEnabled(not m.empty())
+        for b in (self.undo_b, self.redo_b, self.clear_b):
+            b.update()
+
+
+class TextPrompt(Dialog):
+    def __init__(self, app):
+        super().__init__(app, "Add text")
+        self.setModal(True)
+        self.body.addWidget(label("Text to put on the image:", "dim"))
+        self.edit = QLineEdit()
+        self.edit.setMinimumWidth(360)
+        self.edit.returnPressed.connect(self.accept)
+        self.body.addWidget(self.edit)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(button("Cancel", self.reject))
+        row.addWidget(button("Add", self.accept, accent=True))
+        self.body.addLayout(row)
+        self.edit.setFocus()
+
+    @staticmethod
+    def ask_text(app):
+        d = TextPrompt(app)
+        ok = d.exec() == QDialog.DialogCode.Accepted
+        return d.edit.text().strip() if ok else ""
+
+
+# --------------------------------------------------------------------------
 # The app
 # --------------------------------------------------------------------------
 
@@ -3299,6 +3939,8 @@ class App:
         self.prefs = None
         self.theme_editor = None
         self.meta_dialog = None
+        self.markup = Markup()
+        self.draw_mode = False
         self._showing_error = False
         self._resize_cursor = False
         self._quitting = False
@@ -3385,8 +4027,9 @@ class App:
         self.filmstrip.setVisible(s["show_filmstrip"] and not full)
         self.info_panel.setVisible(s["show_info"] and not full)
         self.status.setVisible(s["status_bar"] and not full)
+        self.drawbar.setVisible(self.draw_mode)
         if not full:
-            self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+            self.canvas.setCursor(self.canvas.idle_cursor())
             self.canvas.hide_cursor_timer.stop()
         else:
             self.canvas.hide_cursor_timer.start(2000)
@@ -3413,6 +4056,8 @@ class App:
         lay.addWidget(self.titlebar)
         lay.addWidget(top_sep)
         self.chrome_widgets = [self.titlebar, top_sep]
+        self.drawbar = DrawBar(self)
+        lay.addWidget(self.drawbar)
         body = QWidget()
         bl = QHBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
@@ -3496,6 +4141,7 @@ class App:
         self.recent_menu.aboutToShow.connect(self.fill_recent)
         fm.addSeparator()
         A(fm, "Save a copy as...", self.save_as, "Ctrl+S")
+        A(fm, "Paste image", self.paste_image, "Ctrl+V")
         A(fm, "Copy image", self.copy_image, "Ctrl+C")
         A(fm, "Copy file path", self.copy_path, "Ctrl+Shift+C")
         fm.addSeparator()
@@ -3559,6 +4205,19 @@ class App:
         sm.addSeparator()
         self.checks["sort_desc"] = A(sm, "Reverse order", lambda v: self.set_setting("sort_desc", bool(v)),
                                      checkable=True, checked=s["sort_desc"])
+
+        dm = mb.addMenu("Draw")
+        self.draw_action = A(dm, "Drawing mode", self.toggle_draw, "D")
+        dm.addSeparator()
+        A(dm, "Undo", self.markup_undo, "Ctrl+Z")
+        A(dm, "Redo", self.markup_redo, ["Ctrl+Shift+Z", "Ctrl+Y"])
+        A(dm, "Erase all drawings", self.markup_clear)
+        dm.addSeparator()
+        tm = dm.addMenu("Tool")
+        for key, text in DRAW_TOOLS:
+            tm.addAction(text.split(" (")[0], lambda k=key: self.drawbar.pick_tool(k))
+        dm.addSeparator()
+        A(dm, "Save over the original", self.save_over_original)
 
         self.theme_menu = mb.addMenu("Theme")
         self.theme_menu.aboutToShow.connect(self.fill_theme_menu)
@@ -3625,7 +4284,10 @@ class App:
     def show_context_menu(self, gpos):
         m = QMenu(self.win)
         has = self.current_path is not None
-        for text, fn, ok in (("Open...", self.open_dialog, True), (None, None, None),
+        for text, fn, ok in (("Open...", self.open_dialog, True), ("Paste image", self.paste_image, True),
+                             (None, None, None),
+                             ("Leave drawing mode" if self.draw_mode else "Draw on it", self.toggle_draw, has),
+                             (None, None, None),
                              ("Fit to window", self.canvas.set_fit, has),
                              ("Actual size (100%)", lambda: self.canvas.zoom_to(1.0), has),
                              ("Rotate right", lambda: self.canvas.rotate(1), has),
@@ -3703,6 +4365,9 @@ class App:
         elif key == "slideshow_seconds":
             if self.slideshow.isActive():
                 self.slideshow.start(s["slideshow_seconds"] * 1000)
+        elif key in ("draw_tool", "draw_color", "draw_size"):
+            if hasattr(self, "drawbar"):
+                self.drawbar.sync()
         elif key in ("fit_mode", "smooth_scaling", "pixelated_zoom", "checkerboard"):
             self.canvas._cache = None
             self.canvas.update()
@@ -3795,13 +4460,15 @@ class App:
             self.filmstrip.select(self.index)
             self.refresh_all()
         elif self.files:
-            self.show_index(min(max(0, old_index), len(self.files) - 1))
+            self.show_index(min(max(0, old_index), len(self.files) - 1), force=True)
             self.flash("The image was moved or deleted by another program")
         else:
             self.close_image("This folder has no images left")
 
     def open_path(self, path, quiet=False):
         path = os.path.abspath(os.path.expanduser(path))
+        if path != self.current_path and not self.markup_ok():
+            return False
         if os.path.isdir(path):
             self.scan_folder(path)
             if not self.files:
@@ -3810,7 +4477,7 @@ class App:
                 self.close_image("No images in %s" % path)
                 return False
             self.add_recent(path)
-            self.show_index(0)
+            self.show_index(0, force=True)
             return True
         if not os.path.isfile(path):
             if not quiet:
@@ -3821,15 +4488,20 @@ class App:
         if folder != self.folder or path not in self.files:
             self.scan_folder(folder, keep=path)
         self.add_recent(path)
-        self.show_index(self.files.index(path) if path in self.files else 0)
+        self.show_index(self.files.index(path) if path in self.files else 0, force=True)
         return True
 
-    def show_index(self, i, keep_view=False):
+    def show_index(self, i, keep_view=False, force=False):
         if not self.files:
             return
         i = max(0, min(len(self.files) - 1, i))
-        self.index = i
         path = self.files[i]
+        if path != self.current_path:
+            if not force and not self.markup_ok():
+                self.filmstrip.select(self.index)
+                return
+            self.reset_markup()
+        self.index = i
         self.current_path = path
         self._stop_movie()
         if path in self.cache:
@@ -3871,6 +4543,9 @@ class App:
         self.canvas.set_image(img, reset_view=not keep_view)
         if animated and not self.movie.currentImage().isNull():
             self.canvas.set_frame(self.movie.currentImage())
+        if animated and self.draw_mode:
+            self.movie.setPaused(True)
+        self.canvas.setCursor(self.canvas.idle_cursor())
         self.refresh_all()
 
     def on_loaded(self, path, img, err):
@@ -3928,6 +4603,7 @@ class App:
             self.show_index(random.choice(choices))
 
     def close_image(self, message=""):
+        self.reset_markup()
         self._stop_movie()
         self.current_path = None
         self.index = -1
@@ -4057,7 +4733,11 @@ class App:
         img = self.canvas.transformed_image()
         if img is not None:
             QApplication.clipboard().setImage(img)
-            self.flash("Image copied")
+            if not self.markup.empty():
+                self.markup.dirty = False
+                self.flash("Image copied with your drawings")
+            else:
+                self.flash("Image copied")
 
     def copy_path(self):
         if self.current_path:
@@ -4070,16 +4750,23 @@ class App:
     def save_as(self):
         img = self.canvas.transformed_image()
         if img is None:
-            return
+            return False
         base, ext = os.path.splitext(os.path.basename(self.current_path))
         writable = {bytes(f).decode("ascii", "ignore").lower() for f in QImageWriter.supportedImageFormats()}
         ext = ext.lower() if ext.lower().lstrip(".") in writable else ".png"
-        start = os.path.join(os.path.dirname(self.current_path), base + " copy" + ext)
+        folder = os.path.dirname(self.current_path)
+        if self.is_pasted(self.current_path):
+            pics = os.path.join(os.path.expanduser("~"), "Pictures")
+            folder = pics if os.path.isdir(pics) else os.path.expanduser("~")
+            base = base.replace("Pasted", "Screenshot")
+            start = os.path.join(folder, base + ext)
+        else:
+            start = os.path.join(folder, base + (" marked" if not self.markup.empty() else " copy") + ext)
         path, _ = QFileDialog.getSaveFileName(self.win, "Save a copy as", start,
                                               "PNG (*.png);;JPEG (*.jpg *.jpeg);;WebP (*.webp);;"
                                               "BMP (*.bmp);;All files (*)")
         if not path:
-            return
+            return False
         if not os.path.splitext(path)[1]:
             path += ext
         fmt = os.path.splitext(path)[1].lstrip(".").lower()
@@ -4088,14 +4775,21 @@ class App:
         if not img.save(path, None, 95 if fmt in ("jpg", "jpeg", "webp") else -1):
             self.error("Couldn't save", "Saving to %s didn't work." % os.path.basename(path),
                        detail="Check the file type and that the folder is writable.")
-            return
+            return False
+        self.markup.dirty = False
         self.flash("Saved %s" % os.path.basename(path))
         if self.movie is not None:
             self.flash("Saved the current frame as %s" % os.path.basename(path))
+        return True
 
     def trash_current(self):
+        if self.draw_mode:  # Delete while drawing removes the last drawing, not the file
+            self.markup_undo()
+            return
         p = self.current_path
         if not p:
+            return
+        if not self.markup_ok():
             return
         if self.settings["confirm_delete"]:
             if not self.ask("Move to trash?", 'Move "%s" to the trash?' % os.path.basename(p),
@@ -4128,7 +4822,7 @@ class App:
         self.cache.pop(p, None)
         self.filmstrip.set_files(self.files)
         if self.files:
-            self.show_index(min(i, len(self.files) - 1))
+            self.show_index(min(i, len(self.files) - 1), force=True)
         else:
             self.close_image("No images left in this folder")
 
@@ -4192,6 +4886,160 @@ class App:
         self.flash("Renamed to %s" % new)
         return None
 
+    # ---- drawing
+    def toggle_draw(self):
+        if not self.draw_mode and self.canvas.img is None:
+            self.flash("Open an image first")
+            return
+        self.draw_mode = not self.draw_mode
+        self.canvas.drawing = None
+        if self.movie is not None:
+            self.movie.setPaused(self.draw_mode)
+        if self.draw_mode and self.slideshow.isActive():
+            self.toggle_slideshow()
+        self.drawbar.sync()
+        self.update_chrome()
+        self.canvas.setCursor(self.canvas.idle_cursor())
+        self.canvas.update()
+        if self.draw_mode:
+            self.flash("Drawing - drag on the image. Ctrl+C copies it, Esc when you're done")
+        elif not self.markup.empty():
+            self.flash("Your drawings stay until you go to another image")
+
+    def markup_add(self, shape):
+        self.markup.add(shape)
+        self.drawbar.sync_history()
+        self.canvas.update()
+
+    def markup_undo(self):
+        if self.markup.undo():
+            self.drawbar.sync_history()
+            self.canvas.update()
+
+    def markup_redo(self):
+        if self.markup.redo():
+            self.drawbar.sync_history()
+            self.canvas.update()
+
+    def markup_clear(self):
+        self.markup.clear()
+        self.drawbar.sync_history()
+        self.canvas.update()
+
+    def reset_markup(self):
+        self.markup.reset()
+        self.canvas.drawing = None
+        if hasattr(self, "drawbar"):
+            self.drawbar.sync_history()
+
+    def markup_ok(self, quitting=False):
+        """True if it's fine to throw away the current drawings (asks if they haven't been saved/copied)."""
+        if self.markup.empty() or not self.markup.dirty:
+            return True
+        what = "quitting" if quitting else "moving on"
+        choice = self.ask("Keep your drawing?", "You drew on this image but haven't saved or copied it.",
+                          [("Save a copy...", "save", True), ("Copy", "copy", False), ("Throw away", "discard", False),
+                           ("Cancel", None, False)],
+                          detail="Pick what to do with it before %s." % what)
+        if choice == "save":
+            return bool(self.save_as())
+        if choice == "copy":
+            self.copy_image()
+            return True
+        return choice == "discard"
+
+    def can_overwrite(self):
+        p = self.current_path
+        if not p or self.canvas.img is None or self.movie is not None:
+            return False
+        ext = os.path.splitext(p)[1].lower().lstrip(".")
+        writable = {bytes(f).decode("ascii", "ignore").lower() for f in QImageWriter.supportedImageFormats()}
+        return ext in writable and ext not in ("svg", "svgz", "gif", "ico", "cur", "icns")
+
+    def save_over_original(self):
+        p = self.current_path
+        if not self.can_overwrite():
+            self.flash("Can't save over this kind of file - use Save a copy")
+            return False
+        if self.markup.empty() and not (self.canvas.rotation or self.canvas.flip_h or self.canvas.flip_v):
+            self.flash("Nothing changed")
+            return False
+        if not self.ask("Save over the original?", 'Replace "%s" with this version?' % os.path.basename(p),
+                        [("Replace", True, True), ("Cancel", None, False)],
+                        detail="The drawings (and any rotation) get burned into the file. This can't be undone."):
+            return False
+        img = self.canvas.transformed_image()
+        fmt = os.path.splitext(p)[1].lstrip(".").lower()
+        if fmt in ("jpg", "jpeg") and img.hasAlphaChannel():
+            img = img.convertToFormat(QImage.Format.Format_RGB32)
+        tmp = p + ".slopview-tmp"
+        if not img.save(tmp, fmt.upper() if fmt != "jpg" else "JPG", 95 if fmt in ("jpg", "jpeg", "webp") else -1):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            self.error("Couldn't save", "Saving over %s didn't work." % os.path.basename(p))
+            return False
+        try:
+            shutil.copymode(p, tmp)
+        except OSError:
+            pass
+        try:
+            os.replace(tmp, p)
+        except OSError as e:
+            self.error("Couldn't save", str(e))
+            return False
+        self.cache.pop(p, None)
+        self.thumb_cache = collections.OrderedDict((k, v) for k, v in self.thumb_cache.items() if k[0] != p)
+        self.reset_markup()
+        self.canvas.set_image(img, reset_view=False)
+        self.canvas.rotation = 0
+        self.canvas.flip_h = self.canvas.flip_v = False
+        self.cache[p] = img
+        self.filmstrip.load_visible() if hasattr(self.filmstrip, "load_visible") else None
+        self.refresh_all()
+        self.flash("Saved over %s" % os.path.basename(p))
+        return True
+
+    PASTE_DIR = os.path.join(tempfile.gettempdir(), "slopview-pastes")
+
+    def is_pasted(self, path):
+        return bool(path) and os.path.dirname(os.path.abspath(path)) == os.path.abspath(self.PASTE_DIR)
+
+    def paste_image(self):
+        cb = QApplication.clipboard()
+        md = cb.mimeData()
+        if md is not None and md.hasUrls():
+            for u in md.urls():
+                if u.isLocalFile() and (os.path.isdir(u.toLocalFile()) or self.is_image(u.toLocalFile())):
+                    self.open_path(u.toLocalFile())
+                    return
+        img = cb.image()
+        if img.isNull():
+            self.flash("There's no image on the clipboard")
+            return
+        if not self.markup_ok():
+            return
+        os.makedirs(self.PASTE_DIR, exist_ok=True)
+        now = time.time()
+        for n in os.listdir(self.PASTE_DIR):  # tidy pastes older than two days
+            f = os.path.join(self.PASTE_DIR, n)
+            try:
+                if now - os.path.getmtime(f) > 2 * 86400 and f != self.current_path:
+                    os.remove(f)
+            except OSError:
+                pass
+        path = os.path.join(self.PASTE_DIR, time.strftime("Pasted %Y-%m-%d %H-%M-%S.png"))
+        k = 2
+        while os.path.exists(path):
+            path = os.path.join(self.PASTE_DIR, time.strftime("Pasted %Y-%m-%d %H-%M-%S") + " (%d).png" % k)
+            k += 1
+        if not img.save(path, "PNG"):
+            self.error("Couldn't paste", "Saving the pasted image to a temporary file didn't work.")
+            return
+        self.open_path(path)
+        self.flash("Pasted - press D to draw on it, Ctrl+S to save it")
+
     # ---- slideshow / escape
     def toggle_slideshow(self):
         if self.slideshow.isActive():
@@ -4211,7 +5059,13 @@ class App:
             self.go(1)
 
     def escape(self):
-        if self.slideshow.isActive():
+        if self.draw_mode:
+            if self.canvas.drawing is not None:
+                self.canvas.drawing = None
+                self.canvas.update()
+            else:
+                self.toggle_draw()
+        elif self.slideshow.isActive():
             self.toggle_slideshow()
         elif self.win.isFullScreen():
             self.toggle_fullscreen()
@@ -4226,7 +5080,9 @@ class App:
             ("Fit / actual size", "0 / 1  (or double-click)"), ("Pan", "Drag with the mouse"),
             ("Rotate right / left", "R / L"), ("Flip horizontal / vertical", "H / V"),
             ("Full screen", "F, F11, Enter or middle-click"), ("Slideshow", "S  (Esc stops)"),
-            ("Filmstrip / info panel", "T / I"), ("All metadata", "M"), ("Copy image / copy path", M + "C / " + M + "Shift+C"),
+            ("Filmstrip / info panel", "T / I"), ("All metadata", "M"),
+            ("Draw on the image", "D  (Ctrl+Z undo, Shift for straight lines / perfect circles)"),
+            ("Paste a screenshot", M + "V"), ("Copy image / copy path", M + "C / " + M + "Shift+C"),
             ("Save a copy (with rotation)", M + "S"), ("Rename / move to trash", "F2 / Delete"),
             ("Open file / folder", M + "O / " + M + "Shift+O"), ("Preferences", M + ","),
             ("Open images", "Drag them onto the window"),
@@ -4302,6 +5158,8 @@ class App:
         self.qapp.quit()
 
     def confirm_quit(self):
+        if not self.markup_ok(quitting=True):
+            return False
         self.slideshow.stop()
         self._stop_movie()
         if self.win.isFullScreen():
