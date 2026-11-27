@@ -37,7 +37,7 @@ import zlib
 
 APP_NAME = "SlopView"
 APP_ID = "slopware.slopview"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 REPO_URL = "https://github.com/Techrul/slopware"
 
 IS_WIN = sys.platform.startswith("win")
@@ -297,6 +297,7 @@ DEFAULT_SETTINGS = {
     "draw_tool": "ellipse",
     "draw_color": "#ff3b30",
     "draw_size": 4,
+    "ocr_lang": "",
     "reopen_last": True,
     "last_path": "",
     "ui_font_size": 10,
@@ -1990,6 +1991,8 @@ class Canvas(QWidget):
         self._drag = None
         self.drawing = None
         self._draw_start = None
+        self.text_select = False  # dragging a box to read text from
+        self._sel = None
         self._cache = None
         self._cache_key = None
         self._checker = None
@@ -2208,6 +2211,18 @@ class Canvas(QWidget):
         if shapes or self.drawing:
             p.setTransform(self.image_transform())
             paint_shapes(p, shapes + ([self.drawing] if self.drawing else []), self.img)
+        if self.text_select and self._sel is not None:
+            p.resetTransform()
+            r = QRectF(self._sel[0], self._sel[1]).normalized()
+            shade = QPainterPath()
+            shade.addRect(QRectF(self.rect()))
+            hole = QPainterPath()
+            hole.addRect(r)
+            p.fillPath(shade.subtracted(hole), QColor(0, 0, 0, 120))
+            pen = QPen(QColor(t["accent"]), 1.5, Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(r)
         p.end()
 
     def resizeEvent(self, e):
@@ -2224,6 +2239,10 @@ class Canvas(QWidget):
             return
         if b == Qt.MouseButton.ForwardButton:
             self.app.go(1)
+            return
+        if self.text_select and self.pix is not None and b == Qt.MouseButton.LeftButton:
+            self._sel = (QPointF(e.position()), QPointF(e.position()))
+            self.update()
             return
         if self.app.draw_mode and self.pix is not None:
             if b == Qt.MouseButton.LeftButton:
@@ -2244,6 +2263,10 @@ class Canvas(QWidget):
         if self.drawing is not None:
             self.move_shape(e.position(), e.modifiers())
             return
+        if self._sel is not None:
+            self._sel = (self._sel[0], QPointF(e.position()))
+            self.update()
+            return
         if self._drag is not None:
             start, off = self._drag
             self.offset = off + (e.position() - start)
@@ -2253,11 +2276,19 @@ class Canvas(QWidget):
             self.setCursor(self.idle_cursor())
 
     def idle_cursor(self):
-        if self.app.draw_mode and self.pix is not None:
+        if (self.app.draw_mode or self.text_select) and self.pix is not None:
             return Qt.CursorShape.CrossCursor
         return Qt.CursorShape.OpenHandCursor if self.can_pan() else Qt.CursorShape.ArrowCursor
 
     def mouseReleaseEvent(self, e):
+        if self._sel is not None and e.button() == Qt.MouseButton.LeftButton:
+            r = QRectF(self._sel[0], QPointF(e.position())).normalized()
+            self._sel = None
+            self.text_select = False
+            self.setCursor(self.idle_cursor())
+            self.update()
+            self.app.finish_text_area(r)
+            return
         if self.drawing is not None and e.button() == Qt.MouseButton.LeftButton:
             self.move_shape(e.position(), e.modifiers())
             self.finish_shape(e.position())
@@ -2313,7 +2344,7 @@ class Canvas(QWidget):
         self.app.markup_add(d)
 
     def mouseDoubleClickEvent(self, e):
-        if self.app.draw_mode:
+        if self.app.draw_mode or self.text_select:
             return
         if e.button() != Qt.MouseButton.LeftButton or self.pix is None:
             return
@@ -3913,6 +3944,317 @@ class TextPrompt(Dialog):
 
 
 # --------------------------------------------------------------------------
+# Text recognition (OCR): Windows' built-in OCR, or Tesseract if it's installed
+# --------------------------------------------------------------------------
+
+_WIN_OCR_PS = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime]
+$null = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, $type) {
+    $t = $asTask.MakeGenericMethod($type).Invoke($null, @($op))
+    $null = $t.Wait(-1)
+    $t.Result
+}
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($env:SLOPVIEW_OCR_FILE)) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$engine = $null
+if ($env:SLOPVIEW_OCR_LANG) {
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new($env:SLOPVIEW_OCR_LANG))
+}
+if ($engine -eq $null) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }
+if ($engine -eq $null) { Write-Error 'No OCR language installed'; exit 3 }
+$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+$stream.Dispose()
+foreach ($line in $result.Lines) { [Console]::Out.WriteLine($line.Text) }
+"""
+
+_WIN_LANGS_PS = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+foreach ($l in [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages) {
+    [Console]::Out.WriteLine($l.LanguageTag + "`t" + $l.DisplayName)
+}
+"""
+
+TESS_NAMES = {
+    "eng": "English", "chi_sim": "Chinese (simplified)", "chi_tra": "Chinese (traditional)", "jpn": "Japanese",
+    "kor": "Korean", "deu": "German", "fra": "French", "spa": "Spanish", "ita": "Italian", "por": "Portuguese",
+    "rus": "Russian", "ara": "Arabic", "heb": "Hebrew", "hin": "Hindi", "nld": "Dutch", "pol": "Polish",
+    "tur": "Turkish", "ukr": "Ukrainian", "vie": "Vietnamese", "ind": "Indonesian", "swe": "Swedish",
+    "tha": "Thai", "ell": "Greek", "ces": "Czech", "fin": "Finnish", "dan": "Danish", "nor": "Norwegian",
+}
+
+
+def _hidden_startupinfo():
+    if not IS_WIN:
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return si
+
+
+def _powershell(script):
+    """Run a script without any command-line quoting trouble (-EncodedCommand takes UTF-16LE base64)."""
+    import base64
+    enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc]
+
+
+def _run_text(cmd, timeout=60, env=None):
+    kw = {}
+    if IS_WIN:
+        kw["startupinfo"] = _hidden_startupinfo()
+        kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env, **kw)
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
+def find_tesseract():
+    exe = shutil.which("tesseract")
+    if exe:
+        return exe
+    if IS_WIN:
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", ""),
+                     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+            p = os.path.join(base, "Tesseract-OCR", "tesseract.exe")
+            if base and os.path.isfile(p):
+                return p
+    if IS_MAC:
+        for p in ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"):
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+class OcrEngines:
+    """Works out (once) which OCR engines are available and their languages."""
+
+    def __init__(self):
+        self._checked = False
+        self.engines = []  # [(id, display name)]
+        self.tess = None
+        self.langs = {}  # engine id -> [(code, name)]
+
+    def check(self):
+        if self._checked:
+            return
+        self._checked = True
+        if IS_WIN and shutil.which("powershell"):
+            try:
+                code, out, _ = _run_text(_powershell(_WIN_LANGS_PS), timeout=25)
+                langs = [tuple(ln.split("\t", 1)) for ln in out.splitlines() if "\t" in ln]
+                if code == 0 and langs:
+                    self.engines.append(("windows", "Windows OCR"))
+                    self.langs["windows"] = langs
+            except (OSError, subprocess.SubprocessError):
+                pass
+        self.tess = find_tesseract()
+        if self.tess:
+            try:
+                _code, out, err = _run_text([self.tess, "--list-langs"], timeout=15)
+                codes = [ln.strip() for ln in (out + "\n" + err).splitlines()[1:]
+                         if ln.strip() and " " not in ln.strip() and ln.strip() != "osd"]
+                if codes:
+                    self.engines.append(("tesseract", "Tesseract"))
+                    self.langs["tesseract"] = [(c, TESS_NAMES.get(c, c)) for c in sorted(
+                        codes, key=lambda c: (c != "eng", TESS_NAMES.get(c, c)))]
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def install_hint(self):
+        if IS_WIN:
+            return ("Windows' built-in text recognition didn't work here.\n\n"
+                    "Check Settings > Time & language > Language & region: the language you want needs to be "
+                    "installed (its \"Optical character recognition\" part). Or install Tesseract OCR.")
+        if IS_MAC:
+            return "Install Tesseract with Homebrew:\n\n    brew install tesseract tesseract-lang"
+        distro = ""
+        try:
+            with open("/etc/os-release", encoding="utf-8") as f:
+                distro = f.read().lower()
+        except OSError:
+            pass
+        if "arch" in distro or "cachyos" in distro or "manjaro" in distro or "endeavouros" in distro:
+            cmd = "sudo pacman -S tesseract tesseract-data-eng"
+        elif "fedora" in distro:
+            cmd = "sudo dnf install tesseract"
+        elif "suse" in distro:
+            cmd = "sudo zypper install tesseract-ocr tesseract-ocr-traineddata-english"
+        else:
+            cmd = "sudo apt install tesseract-ocr"
+        return ("Getting text out of images needs Tesseract (free, open source).\n"
+                "Install it with:\n\n    %s\n\nOther languages are separate packages "
+                "(for example tesseract-data-chi_sim for Chinese). Then try again - no restart needed." % cmd)
+
+
+def prepare_for_ocr(img):
+    """Make text easier to read: grayscale, dark mode -> light, and scale tiny text up."""
+    g = img.convertToFormat(QImage.Format.Format_Grayscale8)
+    w, h = g.width(), g.height()
+    if w == 0 or h == 0:
+        return g
+    total = n = 0
+    step = max(1, int((w * h / 40000.0) ** 0.5))
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            total += QColor(g.pixel(x, y)).value()
+            n += 1
+    if n and total / n < 110:  # mostly dark background (dark mode screenshot) -> invert
+        g.invertPixels()
+    longest = max(w, h)
+    if longest < 1800:
+        k = 3 if longest < 600 else 2
+        g = g.scaled(w * k, h * k, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    elif longest > 9000:
+        g = g.scaled(9000, 9000, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    return g
+
+
+def run_ocr(engine, tess_path, img, lang):
+    """Blocking: returns (text, error)."""
+    fd, path = tempfile.mkstemp(prefix="slopview-ocr-", suffix=".png")
+    os.close(fd)
+    try:
+        if not prepare_for_ocr(img).save(path, "PNG"):
+            return "", "Couldn't prepare the image."
+        if engine == "windows":
+            env = dict(os.environ, SLOPVIEW_OCR_FILE=path, SLOPVIEW_OCR_LANG=lang or "")
+            code, out, err = _run_text(_powershell(_WIN_OCR_PS), timeout=90, env=env)
+        else:
+            cmd = [tess_path, path, "stdout", "--psm", "3"]
+            if lang:
+                cmd += ["-l", lang]
+            code, out, err = _run_text(cmd, timeout=120)
+        if code != 0:
+            return "", (err.strip() or "The OCR engine failed (exit code %d)." % code)[-800:]
+        lines = [ln.rstrip() for ln in out.replace("\f", "").splitlines()]
+        text = "\n".join(lines).strip()
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text, ""
+    except subprocess.TimeoutExpired:
+        return "", "Reading the text took too long and was stopped."
+    except OSError as e:
+        return "", str(e)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+class OcrJob(QObject):
+    finished = Signal(int, str, str)  # job id, text, error
+
+    def start(self, job_id, engine, tess, img, lang):
+        img = img.copy()
+
+        def work():
+            text, err = run_ocr(engine, tess, img, lang)
+            self.finished.emit(job_id, text, err)
+
+        threading.Thread(target=work, daemon=True).start()
+
+
+class TextDialog(Dialog):
+    """Shows the text read from the image; editable, copyable, re-runnable in another language."""
+
+    def __init__(self, app):
+        super().__init__(app, "Text in image")
+        self.resize(560, 460)
+        self.region_img = None
+        top = QHBoxLayout()
+        self.status = label("", "dim")
+        top.addWidget(self.status, 1)
+        self.lang_btn = DropButton(self._lang_names, "Automatic", self._chosen, min_width=170)
+        self.lang_btn.setToolTip("Language of the text")
+        top.addWidget(self.lang_btn)
+        self.body.addLayout(top)
+        self.box = QPlainTextEdit()
+        self.box.setObjectName("errorbox")
+        self.box.setPlaceholderText("")
+        self.box.setMinimumSize(480, 300)
+        self.body.addWidget(self.box, 1)
+        row = QHBoxLayout()
+        row.addWidget(button("Select an area...", self.pick_area))
+        row.addStretch(1)
+        row.addWidget(button("Close", self.close))
+        self.copy_btn = button("Copy", self.copy, accent=True)
+        row.addWidget(self.copy_btn)
+        self.body.addLayout(row)
+        self._fill_langs()
+
+    def _langs(self):
+        eng = self.app.ocr_engine()
+        return self.app.ocr.langs.get(eng, []) if eng else []
+
+    def _lang_names(self):
+        return ["Automatic"] + [name for _code, name in self._langs()]
+
+    def _fill_langs(self):
+        langs = self._langs()
+        self.lang_btn.setVisible(len(langs) > 1)
+        cur = self.app.settings["ocr_lang"]
+        self.lang_btn.set_value(dict(langs).get(cur, "Automatic"))
+
+    def _chosen(self, name):
+        code = "" if name == "Automatic" else {n: c for c, n in self._langs()}.get(name, "")
+        self.app.set_setting("ocr_lang", code)
+        self._fill_langs()
+        self.app.read_text(self.region_img, again=True)
+
+    def busy(self, what):
+        self.status.setText(what)
+        self.box.setPlainText("")
+        self.box.setPlaceholderText("Reading the text...")
+        self.copy_btn.setEnabled(False)
+
+    def show_result(self, text, err, engine_name):
+        self.copy_btn.setEnabled(bool(text))
+        if err:
+            self.status.setText("Couldn't read the text")
+            self.box.setPlaceholderText("")
+            self.box.setPlainText(err)
+            return
+        if not text:
+            self.status.setText("No text found (%s)" % engine_name)
+            self.box.setPlaceholderText("Didn't find any text. Try selecting just the part with the text, "
+                                        "or pick the right language.")
+            self.box.setPlainText("")
+            return
+        lines = sum(1 for ln in text.splitlines() if ln.strip())
+        self.status.setText("%d line%s \u00b7 read by %s" % (lines, "" if lines == 1 else "s", engine_name))
+        self.status.setToolTip("You can fix any mistakes in the box before copying")
+        self.box.setPlainText(text)
+
+    def copy(self):
+        t = self.box.textCursor().selectedText().replace("\u2029", "\n") or self.box.toPlainText()
+        if t:
+            self.app.copy_text(t)
+
+    def pick_area(self):
+        self.hide()
+        self.app.select_text_area()
+
+    def done(self, r):
+        self.app.text_dialog = None
+        super().done(r)
+
+    def closeEvent(self, e):
+        self.app.text_dialog = None
+        super().closeEvent(e)
+
+
+# --------------------------------------------------------------------------
 # The app
 # --------------------------------------------------------------------------
 
@@ -3941,6 +4283,12 @@ class App:
         self.meta_dialog = None
         self.markup = Markup()
         self.draw_mode = False
+        self.ocr = OcrEngines()
+        self.ocr_job = OcrJob()
+        self.ocr_job.finished.connect(self.on_ocr_done)
+        self._ocr_id = 0
+        self._ocr_region = False
+        self.text_dialog = None
         self._showing_error = False
         self._resize_cursor = False
         self._quitting = False
@@ -4149,6 +4497,8 @@ class App:
         A(fm, "Move to trash", self.trash_current, "Del")
         A(fm, "Open containing folder", self.open_containing)
         A(fm, "Metadata...", self.open_metadata, ["M", "Ctrl+M"])
+        A(fm, "Get text from image", lambda: self.read_text(), "Ctrl+T")
+        A(fm, "Get text from an area...", self.select_text_area, "Ctrl+Shift+T")
         fm.addSeparator()
         A(fm, "Quit", self.win.close, "Ctrl+Q")
 
@@ -4297,7 +4647,9 @@ class App:
                              ("Rename...", self.rename_current, has),
                              ("Move to trash", self.trash_current, has),
                              ("Open containing folder", self.open_containing, has),
-                             ("Metadata...", self.open_metadata, has), (None, None, None),
+                             ("Metadata...", self.open_metadata, has),
+                             ("Get text from image", lambda: self.read_text(), has),
+                             ("Get text from an area...", self.select_text_area, has), (None, None, None),
                              ("Slideshow", self.toggle_slideshow, len(self.files) > 1),
                              ("Full screen", self.toggle_fullscreen, True)):
             if text is None:
@@ -5040,6 +5392,90 @@ class App:
         self.open_path(path)
         self.flash("Pasted - press D to draw on it, Ctrl+S to save it")
 
+    # ---- text recognition
+    def ocr_engine(self):
+        self.ocr.check()
+        ids = [e for e, _n in self.ocr.engines]
+        return ids[0] if ids else None
+
+    def _ocr_lang(self, engine):
+        want = self.settings["ocr_lang"]
+        codes = [c for c, _n in self.ocr.langs.get(engine, [])]
+        if want in codes:
+            return want
+        if engine == "tesseract":
+            return "eng" if "eng" in codes else (codes[0] if codes else "")
+        return ""
+
+    def select_text_area(self):
+        if self.canvas.img is None:
+            self.flash("Open an image first")
+            return
+        self.canvas.drawing = None
+        self.canvas.text_select = True
+        self.canvas.setCursor(self.canvas.idle_cursor())
+        self.canvas.setFocus()
+        self.flash("Drag a box around the text you want (Esc cancels)")
+
+    def finish_text_area(self, wrect):
+        c = self.canvas
+        if c.img is None or wrect.width() < 6 or wrect.height() < 6:
+            self.flash("That box was too small - try again with Ctrl+Shift+T")
+            return
+        corners = [c.to_image(pt) for pt in (wrect.topLeft(), wrect.topRight(), wrect.bottomLeft(),
+                                             wrect.bottomRight())]
+        xs, ys = [q.x() for q in corners], [q.y() for q in corners]
+        r = QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).toAlignedRect().intersected(c.img.rect())
+        if r.width() < 3 or r.height() < 3:
+            self.flash("That box isn't on the image")
+            return
+        crop = c.img.copy(r)
+        if c.rotation or c.flip_h or c.flip_v:
+            crop = crop.transformed(c._orient_transform())
+        self.read_text(crop)
+
+    def read_text(self, region=None, again=False):
+        c = self.canvas
+        if c.img is None:
+            self.flash("Open an image first")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            engine = self.ocr_engine()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if engine is None:
+            self.info("Text recognition isn't set up", self.ocr.install_hint())
+            return
+        if region is None:
+            img = c.img
+            if c.rotation or c.flip_h or c.flip_v:
+                img = img.transformed(c._orient_transform())
+        else:
+            img = region
+        d = self.text_dialog
+        if d is None:
+            d = self.text_dialog = TextDialog(self)
+        d.region_img = region
+        d._fill_langs()
+        d.busy("Reading the %s..." % ("selected area" if region is not None else "whole image"))
+        d.show()
+        d.raise_()
+        self._ocr_id += 1
+        self._ocr_region = region is not None
+        self.ocr_job.start(self._ocr_id, engine, self.ocr.tess, img, self._ocr_lang(engine))
+
+    def on_ocr_done(self, job_id, text, err):
+        if job_id != self._ocr_id:
+            return
+        name = dict(self.ocr.engines).get(self.ocr_engine(), "OCR")
+        if self.text_dialog is not None:
+            self.text_dialog.show_result(text, err, name)
+            self.text_dialog.activateWindow()
+        if self._ocr_region and text and not err:
+            QApplication.clipboard().setText(text)
+            self.flash("Copied the text from that area")
+
     # ---- slideshow / escape
     def toggle_slideshow(self):
         if self.slideshow.isActive():
@@ -5059,7 +5495,13 @@ class App:
             self.go(1)
 
     def escape(self):
-        if self.draw_mode:
+        if self.canvas.text_select:
+            self.canvas.text_select = False
+            self.canvas._sel = None
+            self.canvas.setCursor(self.canvas.idle_cursor())
+            self.canvas.update()
+            self.flash("Cancelled")
+        elif self.draw_mode:
             if self.canvas.drawing is not None:
                 self.canvas.drawing = None
                 self.canvas.update()
@@ -5082,7 +5524,8 @@ class App:
             ("Full screen", "F, F11, Enter or middle-click"), ("Slideshow", "S  (Esc stops)"),
             ("Filmstrip / info panel", "T / I"), ("All metadata", "M"),
             ("Draw on the image", "D  (Ctrl+Z undo, Shift for straight lines / perfect circles)"),
-            ("Paste a screenshot", M + "V"), ("Copy image / copy path", M + "C / " + M + "Shift+C"),
+            ("Paste a screenshot", M + "V"),
+            ("Get text from image / an area", M + "T / " + M + "Shift+T"), ("Copy image / copy path", M + "C / " + M + "Shift+C"),
             ("Save a copy (with rotation)", M + "S"), ("Rename / move to trash", "F2 / Delete"),
             ("Open file / folder", M + "O / " + M + "Shift+O"), ("Preferences", M + ","),
             ("Open images", "Drag them onto the window"),
