@@ -11,6 +11,12 @@ Claude :)
 
 # Software
 
+**Needs:** Python 3.10+ and PySide6 (`sudo pacman -S pyside6` or `pip install PySide6`)
+
+**SlopView extras (optional):**
+- SVG / WebP / TIFF on Linux: `qt6-svg`, `qt6-imageformats` (already included with pip PySide6)
+- Text from images: Tesseract on Linux/Mac (`tesseract` + `tesseract-data-eng`); built in on Windows
+
 | Thing a ling | What it is | Alternatives |
 | --- | --- | --- |
 |[sloppad](https://github.com/Techrul/slopware/blob/main/001-sloppad/sloppad.py)| Notepad/text editor | Whatever's built-in, [Notepad++](https://notepad-plus-plus.org/), [Notepads (Windows only)](https://www.notepadsapp.com/), [Kate](https://kate-editor.org/)|
